@@ -1,7 +1,8 @@
+use crate::db::Value;
 use std::collections::HashMap;
 
 pub struct InMemoryDatabase {
-    pub map: HashMap<Vec<u8>, Vec<u8>>,
+    pub map: HashMap<Vec<u8>, Value>,
 }
 
 impl InMemoryDatabase {
