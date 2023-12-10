@@ -32,13 +32,24 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(database: Box<dyn Database>) -> Self {
+    pub fn new(
+        database: Box<dyn Database>,
+        local_key_opt: Option<identity::Keypair>,
+        bootnodes: Vec<String>,
+    ) -> Self {
         let job_manager = RwLock::new(JobManager {
             jobs: HashMap::new(),
             total_jobs: 0,
         });
 
-        let (swarm, gossip_topic) = Self::initialize_libp2p_stuff();
+        let (mut swarm, gossip_topic) = Self::initialize_libp2p_stuff(local_key_opt);
+
+        for peer in bootnodes.into_iter() {
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(peer.parse(), address);
+        }
 
         Node {
             swarm,
@@ -90,8 +101,14 @@ impl Node {
         }
     }
 
-    fn initialize_libp2p_stuff() -> (Swarm<DirectoryBehaviour>, IdentTopic) {
-        let local_key = identity::Keypair::generate_ed25519();
+    fn initialize_libp2p_stuff(
+        local_key_opt: Option<identity::Keypair>,
+    ) -> (Swarm<DirectoryBehaviour>, IdentTopic) {
+        let local_key = match local_key_opt {
+            Some(local_key) => local_key,
+            None => identity::Keypair::generate_ed25519(),
+        };
+
         let local_peer_id = PeerId::from(local_key.public());
 
         println!("Local peer id: {:?}", local_peer_id);
