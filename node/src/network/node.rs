@@ -10,10 +10,12 @@ use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::PeerId;
 use libp2p::{identity, Swarm};
 use serde::{Deserialize, Serialize};
-use std::error;
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
+use std::{error, vec};
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(NetworkBehaviour)]
 struct DirectoryBehaviour {
@@ -24,40 +26,43 @@ struct DirectoryBehaviour {
 }
 pub struct Node {
     swarm: libp2p::Swarm<DirectoryBehaviour>,
-    database: Box<dyn Database>,
+    database: Mutex<Box<dyn Database>>,
     gossip_topic: IdentTopic,
+    job_manager: RwLock<JobManager>,
 }
 
 impl Node {
     pub fn new(database: Box<dyn Database>) -> Self {
-        let peer_id = Self::create_local_peer_id();
-        let (gossip, gossip_topic) = Self::initialize_gossip();
-        let behaviour = Self::initialize_behaviour(peer_id, gossip);
+        let job_manager = RwLock::new(JobManager {
+            jobs: HashMap::new(),
+            total_jobs: 0,
+        });
 
-        let swarm = Self::initialize_swarm(behaviour);
+        let (swarm, gossip_topic) = Self::initialize_libp2p_stuff();
+
         Node {
             swarm,
-            database,
+            database: Mutex::new(database),
             gossip_topic,
+            job_manager,
         }
     }
-    // Creates a local PeerId
-    fn create_local_peer_id() -> PeerId {
-        let local_key = identity::Keypair::generate_ed25519();
-        let local_peer_id = PeerId::from(local_key.public());
-        println!("Local peer id: {:?}", local_peer_id);
-        local_peer_id
-    }
 
-    fn initialize_gossip() -> (gossipsub::Behaviour, IdentTopic) {
+    fn initialize_gossip(keypair: identity::Keypair) -> (gossipsub::Behaviour, IdentTopic) {
+        let config = gossipsub::ConfigBuilder::default()
+            .build()
+            .expect("Valid Gossipsub config");
+
         let mut gossip = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::RandomAuthor,
-            gossipsub::Config::default(),
+            gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+            config,
         )
-        .unwrap();
+        .expect("Correct Gossipsub instantiation");
 
         let topic = gossipsub::IdentTopic::new("directory-updates");
-        gossip.subscribe(&topic).unwrap();
+        gossip
+            .subscribe(&topic)
+            .expect("Topic subscription to succeed");
 
         (gossip, topic)
     }
@@ -85,32 +90,29 @@ impl Node {
         }
     }
 
-    fn initialize_swarm(behaviour: DirectoryBehaviour) -> Swarm<DirectoryBehaviour> {
-        libp2p::SwarmBuilder::with_new_identity()
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default(),
-                libp2p::tls::Config::new,
-                libp2p::yamux::Config::default,
-            )
-            .unwrap() // Handle this error appropriately
-            .with_behaviour(|_| behaviour)
-            .unwrap() // Handle this error appropriately
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
-            .build()
-    }
+    fn initialize_libp2p_stuff() -> (Swarm<DirectoryBehaviour>, IdentTopic) {
+        let local_key = identity::Keypair::generate_ed25519();
+        let local_peer_id = PeerId::from(local_key.public());
 
-    pub fn publish_new_key(&mut self, key: String) {
-        let topic = self.gossip_topic.clone();
+        println!("Local peer id: {:?}", local_peer_id);
 
-        let message = key.into_bytes(); // Convert the key to bytes
+        let (gossip, gossip_topic) = Self::initialize_gossip(local_key.clone());
 
-        self.swarm
-            .behaviour_mut()
-            .gossip
-            .publish(topic, message)
-            .unwrap();
-        // Note: Handle the Result from publish in a way that fits your error handling strategy
+        (
+            libp2p::SwarmBuilder::with_existing_identity(local_key)
+                .with_tokio()
+                .with_tcp(
+                    libp2p::tcp::Config::default(),
+                    libp2p::tls::Config::new,
+                    libp2p::yamux::Config::default,
+                )
+                .unwrap() // Handle this error appropriately
+                .with_behaviour(|key| Self::initialize_behaviour(key.public().to_peer_id(), gossip))
+                .unwrap() // Handle this error appropriately
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
+                .build(),
+            gossip_topic,
+        )
     }
 
     async fn handle_ping_event(&mut self, event: ping::Event) -> Result<(), anyhow::Error> {
@@ -138,14 +140,19 @@ impl Node {
         match event {
             gossipsub::Event::Message {
                 propagation_source,
-                message_id,
                 message,
+                ..
             } => {
-                println!(
-                    "Received gossipsub message {:?} {:?} {:?}",
-                    propagation_source, message_id, message
-                );
-                todo!()
+                let new_key = message.data;
+
+                let mut database = self.database.lock().await;
+
+                if let Some(Value::Pointer(_)) = database.get(&new_key) {
+                    Ok(())
+                } else {
+                    database.insert(new_key, Value::Pointer(propagation_source.to_string()));
+                    Ok(())
+                }
             }
             _ => Ok(()),
         }
@@ -157,12 +164,16 @@ impl Node {
         value: Vec<u8>,
         channel: ResponseChannel<DirectorySpecificResponse>,
     ) -> Result<(), anyhow::Error> {
-        let response = match self.database.get(&key) {
+        let mut database = self.database.lock().await;
+
+        //
+
+        let response = match database.get(&key) {
             None => DirectorySpecificResponse::Err(DirectorySpecificErrors::UnexpectedRequest(
                 UnexpectedRequest { key },
             )),
             Some(_) => {
-                self.database.update(key.clone(), Value::Direct(value));
+                database.update(key.clone(), Value::Direct(value));
                 DirectorySpecificResponse::Ok
             }
         };
@@ -182,7 +193,8 @@ impl Node {
         channel: ResponseChannel<DirectorySpecificResponse>,
         peer: PeerId,
     ) -> Result<(), anyhow::Error> {
-        match self.database.get(&key) {
+        let mut database = self.database.lock().await;
+        match database.get(&key) {
             None => {
                 // Implement logic for None case
                 todo!();
@@ -215,7 +227,7 @@ impl Node {
                         request_type: request_value,
                     },
                 );
-                self.database.update(key, Value::Pointer(peer.to_string()));
+                database.update(key, Value::Pointer(peer.to_string()));
                 Ok(())
             }
         }
@@ -286,6 +298,107 @@ impl Node {
             }
         }
     }
+
+    async fn add_new_job(&mut self, key: Vec<u8>) -> JobState {
+        let mut job_manager = self.job_manager.write().await;
+        job_manager.total_jobs += 1;
+
+        let job_state = JobState::Waiting;
+
+        job_manager.jobs.insert(key, job_state.clone());
+        job_state
+    }
+
+    async fn start_request_process(&mut self, key: Vec<u8>, next_peer: String) -> JobState {
+        let local_peer_id = self.swarm.local_peer_id().to_owned();
+        let next_peer = PeerId::from_str(&next_peer).expect("Invalid PeerId format");
+        self.swarm.behaviour_mut().request_response.send_request(
+            &next_peer,
+            DirectorySpecificRequest {
+                key: key.clone(),
+                request_type: InnerRequestValue::ObjectRequest {
+                    source: local_peer_id.to_string(),
+                },
+            },
+        );
+
+        self.add_new_job(key).await
+    }
+
+    pub async fn get_value(
+        &mut self,
+        key: Vec<u8>,
+    ) -> Result<GetValueResponse, DirectorySpecificErrors> {
+        let job_entry = {
+            // Clone the key for immutable borrow and limit the scope of the borrow
+            let key_clone = key.clone();
+            let job_manager = self.job_manager.read().await;
+            job_manager.jobs.get(&key_clone).cloned()
+        };
+
+        match job_entry {
+            None => {
+                // If it has no job related to this, either the node already has the key, or has to request iti
+                let next_peer = {
+                    let database = self.database.lock().await;
+
+                    match database.get(&key) {
+                        None => {
+                            return Err(DirectorySpecificErrors::KeyDoesNotExist(KeyDoesNotExist {
+                                key,
+                            }))
+                        }
+                        Some(Value::Direct(value)) => return Ok(GetValueResponse::Owner(value)),
+                        Some(Value::Pointer(next_peer)) => next_peer.clone(),
+                    }
+                };
+
+                let job_state = self.start_request_process(key, next_peer).await;
+                Ok(GetValueResponse::Requested(job_state))
+            }
+
+            // Otherwise, it has either a pending request, a finished request or a failed request
+            Some(JobState::Finished) => {
+                self.job_manager.write().await.jobs.remove(&key);
+                let database = self.database.lock().await;
+
+                if let Some(Value::Direct(value)) = database.get(&key) {
+                    Ok(GetValueResponse::Owner(value))
+                } else {
+                    panic!("Impossible!")
+                }
+            }
+            Some(JobState::Failed(e)) => Err(e.clone()),
+            Some(JobState::Waiting) => Ok(GetValueResponse::Requested(JobState::Waiting)),
+        }
+    }
+
+    fn publish_new_key(&mut self, key: Vec<u8>) {
+        let topic = self.gossip_topic.clone();
+
+        self.swarm
+            .behaviour_mut()
+            .gossip
+            .publish(topic, key)
+            .unwrap();
+    }
+
+    pub async fn add_new_value(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), KeyAlreadyExists> {
+        {
+            let mut database = self.database.lock().await;
+
+            match database.get(&key) {
+                None => database.insert(key.clone(), Value::Direct(value)),
+                Some(_) => return Err(KeyAlreadyExists { key }),
+            }
+        };
+        self.publish_new_key(key); //TODO handle this error
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -301,9 +414,23 @@ struct DirectorySpecificRequest {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-enum DirectorySpecificErrors {
+pub enum DirectorySpecificErrors {
     NoValueOrPointerFound(NoValueOrPointerFound),
     UnexpectedRequest(UnexpectedRequest),
+    KeyDoesNotExist(KeyDoesNotExist),
+    KeyAlreadyExists(KeyAlreadyExists),
+}
+
+impl fmt::Display for DirectorySpecificErrors {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DirectorySpecificErrors::NoValueOrPointerFound(err) => write!(f, "{}", err),
+            DirectorySpecificErrors::UnexpectedRequest(err) => write!(f, "{}", err),
+            DirectorySpecificErrors::KeyDoesNotExist(err) => write!(f, "{}", err),
+            DirectorySpecificErrors::KeyAlreadyExists(err) => write!(f, "{}", err),
+            // Handle other variants here as well
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -325,7 +452,7 @@ struct GossipMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NoValueOrPointerFound {
+pub struct NoValueOrPointerFound {
     peer_id: String,
     key: Vec<u8>,
     source: Vec<u8>,
@@ -340,7 +467,7 @@ impl fmt::Display for NoValueOrPointerFound {
 impl error::Error for NoValueOrPointerFound {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UnexpectedRequest {
+pub struct UnexpectedRequest {
     key: Vec<u8>,
 }
 
@@ -351,3 +478,47 @@ impl fmt::Display for UnexpectedRequest {
 }
 
 impl error::Error for UnexpectedRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyDoesNotExist {
+    key: Vec<u8>,
+}
+
+impl fmt::Display for KeyDoesNotExist {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Key {:?} does not exist", self.key)
+    }
+}
+
+impl error::Error for KeyDoesNotExist {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyAlreadyExists {
+    key: Vec<u8>,
+}
+
+impl fmt::Display for KeyAlreadyExists {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Key {:?} already exists", self.key)
+    }
+}
+
+impl error::Error for KeyAlreadyExists {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JobState {
+    Waiting,
+    Finished,
+    Failed(DirectorySpecificErrors),
+}
+
+pub struct JobManager {
+    jobs: HashMap<Vec<u8>, JobState>,
+    total_jobs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GetValueResponse {
+    Owner(Vec<u8>),      //Either returns the actual value
+    Requested(JobState), //Or returns the job number
+}

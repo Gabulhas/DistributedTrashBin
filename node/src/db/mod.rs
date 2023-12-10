@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 pub mod memory;
 // pub mod disk;
 
@@ -9,7 +11,7 @@ pub use memory::InMemoryDatabase;
 
 // Implement the trait for the exported structs
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum Value {
     Direct(Vec<u8>), // Direct value
     Pointer(String), // Pointer to another node (e.g., node ID or address)
@@ -42,7 +44,7 @@ pub enum DatabaseType {
     //Disk(DiskDatabase),
 }
 
-pub trait Database {
+pub trait Database: Send {
     fn get(&self, key: &[u8]) -> Option<Value>;
     fn insert(&mut self, key: Vec<u8>, value: Value);
     fn delete(&mut self, key: &[u8]) -> Option<Value>;

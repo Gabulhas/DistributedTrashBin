@@ -82,6 +82,9 @@ A Database/Node system, where
 - Databases are of the Key Value Type.
 - Alongside a Key, Nodes either store a value, or a pointer to another node, and the set of these pointers form the multiple directories.
 
+## TODO
+Add a "per pair" mutex, as it's unecessary to lock the whole db if you are only reading a specific key
+
 
 # Extra
 
