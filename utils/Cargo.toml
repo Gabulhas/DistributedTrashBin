@@ -1,0 +1,10 @@
+[package]
+name = "utils"
+version = "0.1.0"
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+libp2p = { features = [ "tokio", "gossipsub", "dns", "identify", "kad", "macros", "noise", "ping", "pnet", "tcp", "websocket", "yamux", "tls", "request-response", "cbor"] }
+clap = { version = "4.4.11", features = ["derive"] }

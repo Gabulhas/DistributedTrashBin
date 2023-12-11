@@ -1,18 +1,7 @@
 use libp2p::identity::{self, Keypair};
 use std::path::PathBuf;
 use tokio::fs::File;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-
-pub async fn generate_key_to_file(file_path: PathBuf) -> io::Result<Keypair> {
-    let key = identity::Keypair::generate_ed25519();
-    let encoded = key.to_protobuf_encoding().unwrap();
-
-    let mut file = File::create(file_path.into_os_string()).await?;
-
-    // Writes some prefix of the byte string, but not necessarily all of it.
-    file.write_all(&encoded).await?;
-    Ok(key)
-}
+use tokio::io::{self, AsyncReadExt};
 
 pub async fn key_from_file(file_path: PathBuf) -> io::Result<Keypair> {
     let mut file = File::open(file_path).await?;

@@ -4,17 +4,21 @@ use anyhow::{anyhow, bail};
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic};
 use libp2p::kad::{self, store::MemoryStore};
+use libp2p::multiaddr::Protocol;
 use libp2p::ping;
 use libp2p::request_response::{self, cbor, Config, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
+use libp2p::Multiaddr;
 use libp2p::PeerId;
 use libp2p::{identity, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{error, vec};
+use tokio::sync::mpsc;
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(NetworkBehaviour)]
@@ -24,11 +28,12 @@ struct DirectoryBehaviour {
     gossip: gossipsub::Behaviour,
     request_response: cbor::Behaviour<DirectorySpecificRequest, DirectorySpecificResponse>, // Add other behaviours here
 }
+
 pub struct Node {
     swarm: libp2p::Swarm<DirectoryBehaviour>,
-    database: Mutex<Box<dyn Database>>,
+    database: Arc<Mutex<Box<dyn Database>>>,
     gossip_topic: IdentTopic,
-    job_manager: RwLock<JobManager>,
+    job_manager: Arc<RwLock<JobManager>>,
 }
 
 impl Node {
@@ -36,26 +41,22 @@ impl Node {
         database: Box<dyn Database>,
         local_key_opt: Option<identity::Keypair>,
         bootnodes: Vec<String>,
+        local_address: Multiaddr,
     ) -> Self {
-        let job_manager = RwLock::new(JobManager {
-            jobs: HashMap::new(),
-            total_jobs: 0,
-        });
+        let (mut swarm, gossip_topic) = Self::initialize_libp2p_stuff(local_key_opt, local_address);
 
-        let (mut swarm, gossip_topic) = Self::initialize_libp2p_stuff(local_key_opt);
-
-        for peer in bootnodes.into_iter() {
-            swarm
-                .behaviour_mut()
-                .kademlia
-                .add_address(peer.parse(), address);
+        if let Err(e) = Self::add_bootstrap_nodes_to_swarm(&mut swarm, &bootnodes) {
+            panic!("{}", e);
         }
 
         Node {
             swarm,
-            database: Mutex::new(database),
+            database: Arc::new(Mutex::new(database)),
             gossip_topic,
-            job_manager,
+            job_manager: Arc::new(RwLock::new(JobManager {
+                jobs: HashMap::new(),
+                total_jobs: 0,
+            })),
         }
     }
 
@@ -103,6 +104,7 @@ impl Node {
 
     fn initialize_libp2p_stuff(
         local_key_opt: Option<identity::Keypair>,
+        local_address: Multiaddr,
     ) -> (Swarm<DirectoryBehaviour>, IdentTopic) {
         let local_key = match local_key_opt {
             Some(local_key) => local_key,
@@ -115,21 +117,52 @@ impl Node {
 
         let (gossip, gossip_topic) = Self::initialize_gossip(local_key.clone());
 
-        (
-            libp2p::SwarmBuilder::with_existing_identity(local_key)
-                .with_tokio()
-                .with_tcp(
-                    libp2p::tcp::Config::default(),
-                    libp2p::tls::Config::new,
-                    libp2p::yamux::Config::default,
-                )
-                .unwrap() // Handle this error appropriately
-                .with_behaviour(|key| Self::initialize_behaviour(key.public().to_peer_id(), gossip))
-                .unwrap() // Handle this error appropriately
-                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
-                .build(),
-            gossip_topic,
-        )
+        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::tls::Config::new,
+                libp2p::yamux::Config::default,
+            )
+            .unwrap() // Handle this error appropriately
+            .with_behaviour(|key| Self::initialize_behaviour(key.public().to_peer_id(), gossip))
+            .unwrap() // Handle this error appropriately
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
+            .build();
+
+        let _ = swarm.listen_on(local_address);
+
+        (swarm, gossip_topic)
+    }
+
+    fn add_bootstrap_nodes_to_swarm(
+        swarm: &mut Swarm<DirectoryBehaviour>,
+        bootnode_addresses: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for addr_str in bootnode_addresses {
+            println!("Addr_str {}", addr_str);
+            let multiaddr: Multiaddr = addr_str.parse()?;
+            println!("Multiaddr {}", multiaddr);
+
+            // Extract the PeerId from the Multiaddr
+            let peer_id = multiaddr
+                .iter()
+                .find_map(|protocol| {
+                    if let Protocol::P2p(hash) = protocol {
+                        PeerId::from_multihash(hash.into()).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or("Multiaddr does not contain a PeerId")?;
+
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(&peer_id, multiaddr);
+        }
+
+        Ok(())
     }
 
     async fn handle_ping_event(&mut self, event: ping::Event) -> Result<(), anyhow::Error> {
@@ -291,8 +324,51 @@ impl Node {
         }
     }
 
-    pub async fn start_node(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn start_node(
+        &mut self,
+        request_rx: mpsc::Receiver<NodeApiRequest>,
+        response_tx: mpsc::Sender<NodeApiResponse>,
+    ) -> Result<(), anyhow::Error> {
         loop {
+            tokio::select! {
+                 // Handle network events
+                 event = self.swarm.select_next_some() => match event {
+                 SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
+
+                 SwarmEvent::Behaviour(event) => match event {
+                     DirectoryBehaviourEvent::Ping(ping_event) => {
+                         // Extract the `ping::Event` from the `ping_event` and pass it to the handler
+                         self.handle_ping_event(ping_event).await?
+                     }
+                     DirectoryBehaviourEvent::Kademlia(event) => {
+                         self.handle_kad_event(event).await?
+                     }
+                     DirectoryBehaviourEvent::Gossip(event) => {
+                         self.handle_gossip_event(event).await?
+                     }
+                     DirectoryBehaviourEvent::RequestResponse(event) => {
+                         self.handle_request_response_event(event).await?
+                     }
+                 },
+                 _ => {}
+                 },
+            // Handle commands from the channel
+                 command = request_rx.recv() => match command {
+                     Some(NodeApiRequest::GetValue(key)) => {
+                         // Handle GetValue command
+                         // Example: let value = self.get_value(key).await;
+                     },
+                     Some(NodeApiRequest::AddNewValue(key, value)) => {
+                         // Handle AddNewValue command
+                         // Example: self.add_new_value(key, value).await;
+                     },
+                     // ... handle other commands ...
+                     None => break, // Channel closed
+                 },
+             }
+        }
+
+        /*  loop {
             match self.swarm.select_next_some().await {
                 SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
 
@@ -314,6 +390,7 @@ impl Node {
                 _ => {}
             }
         }
+        */
     }
 
     async fn add_new_job(&mut self, key: Vec<u8>) -> JobState {
@@ -538,4 +615,28 @@ pub struct JobManager {
 pub enum GetValueResponse {
     Owner(Vec<u8>),      //Either returns the actual value
     Requested(JobState), //Or returns the job number
+}
+
+enum InnerNodeApiRequest {
+    GetValue {
+        key: Vec<u8>,
+        resp_chan: mpsc::Sender<NodeApiResponse>,
+    },
+    AddNewValue {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        resp_chan: mpsc::Sender<NodeApiResponse>,
+    },
+    // ... other request types ...
+}
+
+pub struct NodeApiRequest {
+    resp_chan: mpsc::Sender<NodeApiResponse>,
+    request_type: InnerNodeApiRequest,
+}
+
+// Response types sent from the Node back to the API
+pub enum NodeApiResponse {
+    ValueResult(Result<GetValueResponse, String>), // String for error message
+    AddValueResult(Result<(), String>),            // String for error message
 }
