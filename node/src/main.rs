@@ -1,12 +1,13 @@
 use crate::db::DatabaseType;
-use crate::network::Node;
+use crate::network::{node::NodeApiRequest, Node};
 use crate::rest::start_rest_api;
 use clap::Parser;
 use core::panic;
 use libp2p::identity::Keypair;
 use libp2p::Multiaddr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::spawn;
+use tokio::sync::mpsc;
+
 mod cli;
 mod db;
 mod network;
@@ -59,25 +60,22 @@ async fn start_node(
     address: Multiaddr,
     rpc_port: u16,
 ) {
-    let node = Node::new(DatabaseType::create(true), keypair, bootnodes, address);
+    let mut node = Node::new(DatabaseType::create(true), keypair, bootnodes, address);
 
-    // Create a shared instance of the node using Arc
-    let shared_node = Arc::new(node);
+    // Create channels for node-API communication
+    let (request_tx, request_rx) = mpsc::channel::<NodeApiRequest>(32);
 
-    // Clone the Arc for use in the first task
-    let node_clone = shared_node.clone();
+    // Clone the request sender for use in the REST API
+    let api_request_tx = request_tx.clone();
 
-    // Spawn the node in an asynchronous task
-    let node_handle = tokio::spawn(async move {
-        node_clone.start_node().await.unwrap();
+    // Spawn the node in an asynchronous task with its request receiver
+    let node_handle = spawn(async move {
+        node.start_node(request_rx).await.unwrap();
     });
 
-    // Clone the Arc for use in the second task (the REST API)
-    let api_clone = shared_node.clone();
-
-    // Spawn the REST API in another asynchronous task
-    let api_handle = tokio::spawn(async move {
-        start_rest_api(api_clone, rpc_port).await;
+    // Spawn the REST API in another asynchronous task with the request sender
+    let api_handle = spawn(async move {
+        start_rest_api(api_request_tx, rpc_port).await;
     });
 
     // Optionally, you can wait for both tasks to complete

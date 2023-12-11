@@ -326,71 +326,53 @@ impl Node {
 
     pub async fn start_node(
         &mut self,
-        request_rx: mpsc::Receiver<NodeApiRequest>,
-        response_tx: mpsc::Sender<NodeApiResponse>,
+        mut api_command_rx: mpsc::Receiver<NodeApiRequest>,
     ) -> Result<(), anyhow::Error> {
         loop {
             tokio::select! {
-                 // Handle network events
-                 event = self.swarm.select_next_some() => match event {
-                 SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
-
-                 SwarmEvent::Behaviour(event) => match event {
-                     DirectoryBehaviourEvent::Ping(ping_event) => {
-                         // Extract the `ping::Event` from the `ping_event` and pass it to the handler
-                         self.handle_ping_event(ping_event).await?
-                     }
-                     DirectoryBehaviourEvent::Kademlia(event) => {
-                         self.handle_kad_event(event).await?
-                     }
-                     DirectoryBehaviourEvent::Gossip(event) => {
-                         self.handle_gossip_event(event).await?
-                     }
-                     DirectoryBehaviourEvent::RequestResponse(event) => {
-                         self.handle_request_response_event(event).await?
-                     }
-                 },
-                 _ => {}
-                 },
-            // Handle commands from the channel
-                 command = request_rx.recv() => match command {
-                     Some(NodeApiRequest::GetValue(key)) => {
-                         // Handle GetValue command
-                         // Example: let value = self.get_value(key).await;
-                     },
-                     Some(NodeApiRequest::AddNewValue(key, value)) => {
-                         // Handle AddNewValue command
-                         // Example: self.add_new_value(key, value).await;
-                     },
-                     // ... handle other commands ...
-                     None => break, // Channel closed
-                 },
-             }
-        }
-
-        /*  loop {
-            match self.swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
-
-                SwarmEvent::Behaviour(event) => match event {
-                    DirectoryBehaviourEvent::Ping(ping_event) => {
-                        // Extract the `ping::Event` from the `ping_event` and pass it to the handler
-                        self.handle_ping_event(ping_event).await?
-                    }
-                    DirectoryBehaviourEvent::Kademlia(event) => {
-                        self.handle_kad_event(event).await?
-                    }
-                    DirectoryBehaviourEvent::Gossip(event) => {
-                        self.handle_gossip_event(event).await?
-                    }
-                    DirectoryBehaviourEvent::RequestResponse(event) => {
-                        self.handle_request_response_event(event).await?
-                    }
+                // Handle network events
+                event = self.swarm.select_next_some() => match event {
+                    SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
+                    SwarmEvent::Behaviour(event) => self.handle_network_event(event).await?,
+                    _ => {},
                 },
-                _ => {}
+
+                // Handle API commands
+                api_command = api_command_rx.recv() => match api_command {
+                    Some(NodeApiRequest::GetValue { key, resp_chan }) => {
+                        // Process GetValue command
+                        let result = self.get_value(key).await; // Example function call
+                        let _ = resp_chan.send(result).await;
+                    },
+                    Some(NodeApiRequest::AddNewValue { key, value, resp_chan }) => {
+                        // Process AddNewValue command
+                        let result = self.add_new_value(key, value).await; // Example function call
+                        let _ = resp_chan.send(result).await;
+                    },
+                    // ... handle other types of API commands ...
+                    None => break, // Channel closed
+                },
             }
         }
-        */
+
+        Ok(())
+    }
+
+    // Separate function to handle network events
+    async fn handle_network_event(
+        &mut self,
+        event: DirectoryBehaviourEvent,
+    ) -> Result<(), anyhow::Error> {
+        match event {
+            DirectoryBehaviourEvent::Ping(ping_event) => self.handle_ping_event(ping_event).await,
+            DirectoryBehaviourEvent::Kademlia(kad_event) => self.handle_kad_event(kad_event).await,
+            DirectoryBehaviourEvent::Gossip(gossip_event) => {
+                self.handle_gossip_event(gossip_event).await
+            }
+            DirectoryBehaviourEvent::RequestResponse(req_res_event) => {
+                self.handle_request_response_event(req_res_event).await
+            } // ... other network event handlers ...
+        }
     }
 
     async fn add_new_job(&mut self, key: Vec<u8>) -> JobState {
@@ -617,26 +599,15 @@ pub enum GetValueResponse {
     Requested(JobState), //Or returns the job number
 }
 
-enum InnerNodeApiRequest {
+pub enum NodeApiRequest {
     GetValue {
         key: Vec<u8>,
-        resp_chan: mpsc::Sender<NodeApiResponse>,
+        resp_chan: mpsc::Sender<Result<GetValueResponse, DirectorySpecificErrors>>,
     },
     AddNewValue {
         key: Vec<u8>,
         value: Vec<u8>,
-        resp_chan: mpsc::Sender<NodeApiResponse>,
+        resp_chan: mpsc::Sender<Result<(), KeyAlreadyExists>>,
     },
     // ... other request types ...
-}
-
-pub struct NodeApiRequest {
-    resp_chan: mpsc::Sender<NodeApiResponse>,
-    request_type: InnerNodeApiRequest,
-}
-
-// Response types sent from the Node back to the API
-pub enum NodeApiResponse {
-    ValueResult(Result<GetValueResponse, String>), // String for error message
-    AddValueResult(Result<(), String>),            // String for error message
 }
