@@ -1,4 +1,5 @@
 use crate::network::node::NodeApiRequest;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
 use tokio::sync::mpsc;
@@ -61,15 +62,25 @@ fn value_fetch_filter(
         })
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+struct AddKeyExpected {
+    key: String,
+    value: Vec<u8>,
+}
+
 // Corrected add_key_filter function
 fn add_key_filter(
     request_tx: mpsc::Sender<NodeApiRequest>,
 ) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     warp::path!("add-key")
         .and(warp::post())
-        .and(warp::body::json::<(String, Vec<u8>)>())
-        .and_then(move |(key, value): (String, Vec<u8>)| {
+        .and(warp::body::json::<AddKeyExpected>())
+        .and_then(move |incoming: AddKeyExpected| {
             let request_tx = request_tx.clone();
+            println!("{:?}", incoming);
+            let key = incoming.key;
+            let value = incoming.value;
+
             async move {
                 let (resp_tx, mut resp_rx) = mpsc::channel(1);
 

@@ -16,6 +16,8 @@ mod utils;
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
+
     let cli_parsed = cli::Cli::parse();
     let keypair = {
         match cli_parsed.key_file {
@@ -43,7 +45,14 @@ async fn main() {
                 .parse::<Multiaddr>()
                 .expect("Invalid multiaddress format")
         } else if let Some(port) = cli_parsed.port {
-            format!("/ip4/0.0.0.0/tcp/{}", port)
+            let ip = {
+                match cli_parsed.ip {
+                    None => "127.0.0.1".to_string(),
+                    Some(a) => a,
+                }
+            };
+
+            format!("/ip4/{}/tcp/{}", ip, port)
                 .parse::<Multiaddr>()
                 .expect("Invalid multiaddress format")
         } else {

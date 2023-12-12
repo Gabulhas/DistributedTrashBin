@@ -1,5 +1,6 @@
 use crate::db::{Database, Value};
 use crate::network::node::request_response::ResponseChannel;
+use crate::utils;
 use anyhow::{anyhow, bail};
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic};
@@ -11,15 +12,14 @@ use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::Multiaddr;
 use libp2p::PeerId;
 use libp2p::{identity, Swarm};
+//use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 use std::{error, vec};
-use tokio::sync::mpsc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(NetworkBehaviour)]
 struct DirectoryBehaviour {
@@ -31,9 +31,9 @@ struct DirectoryBehaviour {
 
 pub struct Node {
     swarm: libp2p::Swarm<DirectoryBehaviour>,
-    database: Arc<Mutex<Box<dyn Database>>>,
+    database: Box<dyn Database>,
     gossip_topic: IdentTopic,
-    job_manager: Arc<RwLock<JobManager>>,
+    job_manager: JobManager,
 }
 
 impl Node {
@@ -51,15 +51,21 @@ impl Node {
 
         Node {
             swarm,
-            database: Arc::new(Mutex::new(database)),
+            database,
             gossip_topic,
-            job_manager: Arc::new(RwLock::new(JobManager {
+            job_manager: JobManager {
                 jobs: HashMap::new(),
-                total_jobs: 0,
-            })),
+            },
         }
     }
 
+    fn print_debug(&self, message: &str) {
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+        let peer_id = self.swarm.local_peer_id();
+        let jobs_count = self.job_manager.jobs.len();
+
+        println!("{timestamp} [Peer ID: {peer_id} | Jobs: {jobs_count}]: {message}");
+    }
     fn initialize_gossip(keypair: identity::Keypair) -> (gossipsub::Behaviour, IdentTopic) {
         let config = gossipsub::ConfigBuilder::default()
             .build()
@@ -88,7 +94,7 @@ impl Node {
         let request_response =
             cbor::Behaviour::<DirectorySpecificRequest, DirectorySpecificResponse>::new(
                 [(
-                    StreamProtocol::new("/my-cbor-protocol"),
+                    StreamProtocol::new("/request-response-directory"),
                     ProtocolSupport::Full,
                 )],
                 Config::default(),
@@ -110,10 +116,6 @@ impl Node {
             Some(local_key) => local_key,
             None => identity::Keypair::generate_ed25519(),
         };
-
-        let local_peer_id = PeerId::from(local_key.public());
-
-        println!("Local peer id: {:?}", local_peer_id);
 
         let (gossip, gossip_topic) = Self::initialize_gossip(local_key.clone());
 
@@ -140,9 +142,7 @@ impl Node {
         bootnode_addresses: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
         for addr_str in bootnode_addresses {
-            println!("Addr_str {}", addr_str);
             let multiaddr: Multiaddr = addr_str.parse()?;
-            println!("Multiaddr {}", multiaddr);
 
             // Extract the PeerId from the Multiaddr
             let peer_id = multiaddr
@@ -155,6 +155,9 @@ impl Node {
                     }
                 })
                 .ok_or("Multiaddr does not contain a PeerId")?;
+            if *swarm.local_peer_id() == peer_id {
+                continue;
+            }
 
             swarm
                 .behaviour_mut()
@@ -165,25 +168,81 @@ impl Node {
         Ok(())
     }
 
-    async fn handle_ping_event(&mut self, event: ping::Event) -> Result<(), anyhow::Error> {
-        println!("Ping event {:?}", event);
+    async fn handle_ping_event(&mut self, _event: ping::Event) -> Result<(), anyhow::Error> {
+        // println!(
+        //
+        //     "{} | {}Ping event {:?}",
+        //     utils::timestamp_now(),
+        //     self.swarm.local_peer_id(),
+        //     event
+        // );
         Ok(())
     }
 
     async fn handle_kad_event(&mut self, event: kad::Event) -> Result<(), anyhow::Error> {
-        match event {
-            kad::Event::OutboundQueryProgressed {
-                result: kad::QueryResult::GetClosestPeers(Ok(ok)),
-                ..
-            } => {
-                if ok.peers.is_empty() {
-                    bail!("Query finished with no closest peers.")
+        match &event {
+            kad::Event::OutboundQueryProgressed { result, .. } => {
+                self.print_debug(&format!(
+                    "{} | {}Outbound query progressed: {:?}",
+                    utils::timestamp_now(),
+                    self.swarm.local_peer_id(),
+                    result
+                ));
+                if let kad::QueryResult::GetClosestPeers(Ok(ok)) = result {
+                    if ok.peers.is_empty() {
+                        bail!("Query finished with no closest peers.")
+                    }
+                    println!(
+                        "{} | {}Closest peers: {:#?}",
+                        utils::timestamp_now(),
+                        self.swarm.local_peer_id(),
+                        ok.peers
+                    );
                 }
-                println!("Query finished with closest peers: {:#?}", ok.peers);
-                Ok(())
             }
-            _ => Ok(()),
+            //kad::Event::UnroutablePeer { peer } => {
+            //    println!(
+            //        "{} | {}Discovered unroutable peer: {:?}",
+            //        utils::timestamp_now(),
+            //        self.swarm.local_peer_id(),
+            //        peer
+            //    );
+            //}
+            kad::Event::RoutingUpdated { peer, .. } => {
+                self.swarm.behaviour_mut().gossip.add_explicit_peer(peer);
+                self.print_debug(&format!(
+                    "{} | {}Routing table updated with peer: {:?}",
+                    utils::timestamp_now(),
+                    self.swarm.local_peer_id(),
+                    peer
+                ));
+            }
+            //kad::Event::RoutablePeer { peer, address } => {
+            //    println!(
+            //        "Routable peer discovered: {:?}, address: {:?}",
+            //        peer, address
+            //    );
+            //}
+            //kad::Event::PendingRoutablePeer { peer, address } => {
+            //    println!(
+            //        "{} | {}Pending routable peer: {:?}, address: {:?}",
+            //        utils::timestamp_now(),
+            //        self.swarm.local_peer_id(),
+            //        peer,
+            //        address
+            //    );
+            //}
+            // Log other event types here
+            _ => {
+                //                println!(
+                //                    "{} | {}Other Kademlia event: {:?}",
+                //                    utils::timestamp_now(),
+                //                    self.swarm.local_peer_id(),
+                //                    event
+                //                );
+            }
         }
+        Ok(())
     }
 
     async fn handle_gossip_event(&mut self, event: gossipsub::Event) -> Result<(), anyhow::Error> {
@@ -195,12 +254,12 @@ impl Node {
             } => {
                 let new_key = message.data;
 
-                let mut database = self.database.lock().await;
-
-                if let Some(Value::Pointer(_)) = database.get(&new_key) {
+                if let Some(Value::Pointer(_)) = self.database.get(&new_key) {
                     Ok(())
                 } else {
-                    database.insert(new_key, Value::Pointer(propagation_source.to_string()));
+                    self.print_debug(&format!("Was told about a new key {:?}", new_key.clone()));
+                    self.database
+                        .insert(new_key, Value::Pointer(propagation_source.to_string()));
                     Ok(())
                 }
             }
@@ -213,20 +272,54 @@ impl Node {
         key: Vec<u8>,
         value: Vec<u8>,
         channel: ResponseChannel<DirectorySpecificResponse>,
+        peer: PeerId,
     ) -> Result<(), anyhow::Error> {
-        let mut database = self.database.lock().await;
+        // ...
 
-        //
-
-        let response = match database.get(&key) {
-            None => DirectorySpecificResponse::Err(DirectorySpecificErrors::UnexpectedRequest(
-                UnexpectedRequest { key },
-            )),
+        self.print_debug(&format!(
+            "Received an OwnershipSend from {} for key {:?}",
+            peer,
+            key.clone()
+        ));
+        let response = match self.database.get(&key) {
+            None => {
+                self.print_debug(&format!(
+                          "Invalid OnwershipSend received from {} for key {:?}: Key not found in database",
+                          peer,
+                          key.clone()
+                        ));
+                DirectorySpecificResponse::Err(DirectorySpecificErrors::UnexpectedRequest(
+                    UnexpectedRequest { key: key.clone() },
+                ))
+            }
             Some(_) => {
-                database.update(key.clone(), Value::Direct(value));
+                self.print_debug(&format!(
+                    "OnwershipSend received from {} for key {:?}: I'm currently owner",
+                    peer,
+                    key.clone()
+                ));
+
+                self.database.update(key.clone(), Value::Direct(value));
+
                 DirectorySpecificResponse::Ok
             }
         };
+
+        if let Some(current_job) = self.job_manager.jobs.get(&key) {
+            let mut job = current_job.lock().await;
+            self.print_debug(&format!(
+                "OnwershipSend received while having a job for key {:?}: Current job info {}",
+                key.clone(),
+                job
+            ));
+
+            job.state = JobState::Finished;
+        } else {
+            panic!(
+                "Impossible! Received an Ownership from {} for {:?} but didn't have any jobs",
+                peer, key
+            )
+        }
 
         self.swarm
             .behaviour_mut()
@@ -243,41 +336,125 @@ impl Node {
         channel: ResponseChannel<DirectorySpecificResponse>,
         peer: PeerId,
     ) -> Result<(), anyhow::Error> {
-        let mut database = self.database.lock().await;
-        match database.get(&key) {
+        let mut update_job = None;
+        let mut forward_peer = None; // this is the peer we should first forward to before changing our current link
+        let mut update_database_pointer = false;
+
+        match self.database.get(&key) {
             None => {
                 // Implement logic for None case
+                // here we can force the nodes that don't know about the key yet, to become a requester
                 todo!();
             }
-
             Some(value) => {
+                //If the Node that received a request is either waiting or just received the object (some client asked the node for it, and node is still waiting for that client to refetch)
+
+                if let Some(job) = self.job_manager.jobs.get(&key) {
+                    let job = job.lock().await;
+                    let job_state = job.state.clone();
+
+                    self.print_debug(&format!(
+                        "Received an object request from {} by {} for {:?}: Currently have a job {}",
+                        peer, source, key, job
+                    ));
+
+                    // There was no previous request, but we have an unfullfiled request, so the job stays the same (either Finished or Waiting), but since we are waiting for the object to be sent or to receive the object, we have to start forwarding incoming requests
+                    match &job.with_request_info {
+                        None => {
+                            update_job = Some((
+                                key.clone(),
+                                Job {
+                                    state: job_state,
+                                    with_request_info: Some(WithRequestInfo {
+                                        requester: source.clone(),
+                                        last_peer: peer.to_string(),
+                                    }),
+                                },
+                            ));
+                        }
+                        // If it's waiting, any other request tha come through him, we should reconsider the link. This can happen for example, when
+                        Some(WithRequestInfo {
+                            requester: previous_requester,
+                            last_peer: previous_last_peer,
+                        }) => {
+                            forward_peer = Some(previous_last_peer.clone());
+                            update_job = Some((
+                                key.clone(),
+                                Job {
+                                    state: job_state,
+                                    with_request_info: Some(WithRequestInfo {
+                                        requester: previous_requester.to_string(),
+                                        last_peer: peer.to_string(),
+                                    }),
+                                },
+                            ));
+                        }
+                    }
+
+                // If the Node received a request and it's not waiting (just idle) or is just owner (with no request), then we just send it directly
+                } else {
+                    update_database_pointer = true;
+
+                    match value {
+                        Value::Direct(actual_value) => {
+                            self.print_debug(&format!(
+                                "Received an object request from {} by {} for {:?}, has no job but has the object. Sending",
+                                peer, source, key
+                            ));
+
+                            //HERE IT'S SENDING THE OBJECt
+                            let response_id =
+                                self.swarm.behaviour_mut().request_response.send_request(
+                                    &PeerId::from_str(&source).expect("Invalid PeerId format"),
+                                    DirectorySpecificRequest {
+                                        key: key.clone(),
+                                        request_type: InnerRequestValue::ObjectOwnershipSend {
+                                            value: actual_value.clone(),
+                                        },
+                                    },
+                                );
+                            self.print_debug(&format!(
+                                "Sending object to {}. Response ID is {}",
+                                source, response_id
+                            ));
+                        }
+                        Value::Pointer(next_peer) => {
+                            self.print_debug(&format!(
+                                "Received an object request from {} by {} for {:?}, has no job and no object",
+                                peer, source, key
+                            ));
+
+                            forward_peer = Some(next_peer);
+                        }
+                    }
+                }
+
+                if let Some((k, n)) = update_job {
+                    self.job_manager.jobs.insert(k, Mutex::new(n));
+                } else if update_job.is_none() {
+                    self.job_manager.jobs.remove(&key);
+                }
+
+                if let Some(next_peer) = forward_peer {
+                    self.swarm.behaviour_mut().request_response.send_request(
+                        &PeerId::from_str(&next_peer).expect("Invalid PeerId format"),
+                        DirectorySpecificRequest {
+                            key: key.clone(),
+                            request_type: InnerRequestValue::ObjectRequest { source },
+                        },
+                    );
+                }
+
                 self.swarm
                     .behaviour_mut()
                     .request_response
                     .send_response(channel, DirectorySpecificResponse::Ok)
                     .map_err(|e| anyhow!("Error sending response: {:?}", e))?;
 
-                let (next_peer, request_value) = match value {
-                    Value::Direct(actual_value) => (
-                        PeerId::from_str(&source).expect("Invalid PeerId format"),
-                        InnerRequestValue::ObjectOwnershipSend {
-                            value: actual_value,
-                        },
-                    ),
-                    Value::Pointer(next_peer) => (
-                        PeerId::from_str(&next_peer).expect("Invalid PeerId format"),
-                        InnerRequestValue::ObjectRequest { source },
-                    ),
-                };
+                if update_database_pointer {
+                    self.database.update(key, Value::Pointer(peer.to_string()));
+                }
 
-                self.swarm.behaviour_mut().request_response.send_request(
-                    &next_peer,
-                    DirectorySpecificRequest {
-                        key: key.clone(),
-                        request_type: request_value,
-                    },
-                );
-                database.update(key, Value::Pointer(peer.to_string()));
                 Ok(())
             }
         }
@@ -295,7 +472,11 @@ impl Node {
                     .await
             }
             InnerRequestValue::ObjectOwnershipSend { value } => {
-                self.handle_object_ownership_send(request.key, value, channel)
+                self.print_debug(&format!(
+                    "Received a Ownership Send {:?} for key {:?}",
+                    peer, request.key
+                ));
+                self.handle_object_ownership_send(request.key, value, channel, peer)
                     .await
             }
         }
@@ -315,8 +496,12 @@ impl Node {
                     request_response::Message::Request {
                         request, channel, ..
                     } => self.handle_request(request, peer, channel).await, // Handle other message types if necessary
-                    request_response::Message::Response { .. } => {
-                        todo!()
+                    request_response::Message::Response {
+                        response,
+                        request_id,
+                    } => {
+                        self.print_debug(&format!("Reponse {:?} with ID {}", response, request_id));
+                        Ok(())
                     }
                 }
             } // Handle other event types if necessary
@@ -332,7 +517,7 @@ impl Node {
             tokio::select! {
                 // Handle network events
                 event = self.swarm.select_next_some() => match event {
-                    SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {address:?}"),
+                    SwarmEvent::NewListenAddr { address, .. } => println!("{} | {}Listening on {address:?}", utils::timestamp_now(), self.swarm.local_peer_id()),
                     SwarmEvent::Behaviour(event) => self.handle_network_event(event).await?,
                     _ => {},
                 },
@@ -376,12 +561,14 @@ impl Node {
     }
 
     async fn add_new_job(&mut self, key: Vec<u8>) -> JobState {
-        let mut job_manager = self.job_manager.write().await;
-        job_manager.total_jobs += 1;
-
         let job_state = JobState::Waiting;
-
-        job_manager.jobs.insert(key, job_state.clone());
+        self.job_manager.jobs.insert(
+            key,
+            Mutex::new(Job {
+                state: job_state.clone(),
+                with_request_info: None,
+            }),
+        );
         job_state
     }
 
@@ -405,47 +592,84 @@ impl Node {
         &mut self,
         key: Vec<u8>,
     ) -> Result<GetValueResponse, DirectorySpecificErrors> {
-        let job_entry = {
-            // Clone the key for immutable borrow and limit the scope of the borrow
-            let key_clone = key.clone();
-            let job_manager = self.job_manager.read().await;
-            job_manager.jobs.get(&key_clone).cloned()
-        };
+        // Clone the key for immutable borrow and limit the scope of the borrow
+        //TODO: Here, if a job entry is final and it's retrieved, we should send the object to the requester (if any) and replace it in the database. If no requester is present, nothing is done
 
-        match job_entry {
+        match self.job_manager.jobs.get(&key) {
             None => {
                 // If it has no job related to this, either the node already has the key, or has to request iti
-                let next_peer = {
-                    let database = self.database.lock().await;
 
-                    match database.get(&key) {
+                let next_peer = {
+                    match self.database.get(&key) {
                         None => {
                             return Err(DirectorySpecificErrors::KeyDoesNotExist(KeyDoesNotExist {
                                 key,
                             }))
                         }
-                        Some(Value::Direct(value)) => return Ok(GetValueResponse::Owner(value)),
+                        Some(Value::Direct(value)) => {
+                            self.print_debug(
+                                "Get Value was executed. Node has the object. Sending directly.",
+                            );
+                            return Ok(GetValueResponse::Owner(value));
+                        }
                         Some(Value::Pointer(next_peer)) => next_peer.clone(),
                     }
                 };
 
+                self.print_debug(&format!(
+                    "Get Value was executed. Node doesn't have the object. requesting {}",
+                    next_peer
+                ));
                 let job_state = self.start_request_process(key, next_peer).await;
+                //TODO: there's something to do here I bet
                 Ok(GetValueResponse::Requested(job_state))
             }
 
-            // Otherwise, it has either a pending request, a finished request or a failed request
-            Some(JobState::Finished) => {
-                self.job_manager.write().await.jobs.remove(&key);
-                let database = self.database.lock().await;
+            // Whe a user re-fetches the value, and it's either there, or just waiting to be there
+            Some(job) => {
+                let job = job.lock().await;
 
-                if let Some(Value::Direct(value)) = database.get(&key) {
-                    Ok(GetValueResponse::Owner(value))
-                } else {
-                    panic!("Impossible!")
+                match &job.state {
+                    // Otherwise, it has either a pending request, a finished request or a failed request
+                    // Check if has any peer, and send
+                    //LOCK/lock/timelock/value lock
+                    JobState::Finished => {
+                        self.print_debug(
+                            "Get Value was executed. Node has the object and job is finished",
+                        );
+
+                        let actual_data = {
+                            if let Some(Value::Direct(value)) = self.database.get(&key) {
+                                value
+                            } else {
+                                panic!("Impossible!")
+                            }
+                        };
+
+                        if let Some(WithRequestInfo {
+                            requester,
+                            last_peer,
+                        }) = &job.with_request_info
+                        {
+                            self.swarm.behaviour_mut().request_response.send_request(
+                                &PeerId::from_str(requester).expect("Invalid PeerId format"),
+                                DirectorySpecificRequest {
+                                    key: key.clone(),
+                                    request_type: InnerRequestValue::ObjectOwnershipSend {
+                                        value: actual_data.clone(),
+                                    },
+                                },
+                            );
+                            self.database
+                                .update(key, Value::Pointer(last_peer.to_string()));
+                        }
+
+                        Ok(GetValueResponse::Owner(actual_data))
+                    }
+                    JobState::Failed(e) => Err(e.clone()),
+                    JobState::Waiting => Ok(GetValueResponse::Requested(JobState::Waiting)),
                 }
             }
-            Some(JobState::Failed(e)) => Err(e.clone()),
-            Some(JobState::Waiting) => Ok(GetValueResponse::Requested(JobState::Waiting)),
         }
     }
 
@@ -464,14 +688,16 @@ impl Node {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<(), KeyAlreadyExists> {
-        {
-            let mut database = self.database.lock().await;
+        self.print_debug(&format!(
+            "New Key-Value added {:?} {:?}",
+            key,
+            value.clone()
+        ));
 
-            match database.get(&key) {
-                None => database.insert(key.clone(), Value::Direct(value)),
-                Some(_) => return Err(KeyAlreadyExists { key }),
-            }
-        };
+        match self.database.get(&key) {
+            None => self.database.insert(key.clone(), Value::Direct(value)),
+            Some(_) => return Err(KeyAlreadyExists { key }),
+        }
         self.publish_new_key(key); //TODO handle this error
         Ok(())
     }
@@ -581,16 +807,58 @@ impl fmt::Display for KeyAlreadyExists {
 
 impl error::Error for KeyAlreadyExists {}
 
+impl fmt::Display for JobState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self {
+            Self::Waiting => "Waiting",
+            Self::Finished => "Finished",
+            Self::Failed(_) => "Failed",
+        };
+
+        write!(f, "{}", s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobState {
     Waiting,
     Finished,
     Failed(DirectorySpecificErrors),
 }
+impl fmt::Display for WithRequestInfo {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Requester {}. Last Peer {}",
+            self.requester, self.last_peer
+        )
+    }
+}
+
+struct WithRequestInfo {
+    requester: String,
+    last_peer: String, //Info about the last peer that directly sent the request to the node
+}
+
+impl fmt::Display for Job {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let with_request_string = {
+            match &self.with_request_info {
+                Some(a) => a.to_string(),
+                None => "No Request Info".to_string(),
+            }
+        };
+        write!(f, "State: {}. {}", self.state, with_request_string)
+    }
+}
+
+struct Job {
+    state: JobState,
+    with_request_info: Option<WithRequestInfo>,
+}
 
 pub struct JobManager {
-    jobs: HashMap<Vec<u8>, JobState>,
-    total_jobs: u32,
+    jobs: HashMap<Vec<u8>, Mutex<Job>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,5 +877,4 @@ pub enum NodeApiRequest {
         value: Vec<u8>,
         resp_chan: mpsc::Sender<Result<(), KeyAlreadyExists>>,
     },
-    // ... other request types ...
 }

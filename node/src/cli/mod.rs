@@ -15,10 +15,13 @@ pub struct Cli {
 
     #[arg(short, long)]
     pub multiaddr: Option<String>,
+
     #[arg(short, long)]
     pub ip: Option<String>,
+
     #[arg(short, long)]
     pub port: Option<u16>,
+
     #[arg(short, long)]
     pub rpc_port: u16,
 }
