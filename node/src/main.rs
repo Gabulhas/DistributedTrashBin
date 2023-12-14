@@ -1,5 +1,5 @@
 use crate::db::DatabaseType;
-use crate::network::{node::NodeApiRequest, Node};
+use crate::network::{communication_types::NodeApiRequest, Node};
 use crate::rest::start_rest_api;
 use clap::Parser;
 use core::panic;

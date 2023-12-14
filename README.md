@@ -91,6 +91,9 @@ A Database/Node system, where
 - There should a notion of time lock or toggleable lock, where if a some requests a value, it can lock it (make the node hold it) for a while
 
 
+- A node should only "erase" a Value from the db after it's sure that the other one received (not a permissionless network or something, so it's just an Ok response back)
+- Improve locks as when sending the object to the node, we can keep handling other connections
+
 # Extra
 
 This isn't easy to grasp in one go. For that, during my bachelor's I've created an implementation and a (live) visualization tool of these mechanisms. You can check it [Here](https://github.com/Gabulhas/Arrow-Distributed-Directory-Protocol). It includes some videos and you can run it on your machine, aswell as interact with the network

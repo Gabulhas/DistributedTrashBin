@@ -1,4 +1,4 @@
-use crate::network::node::NodeApiRequest;
+use crate::network::communication_types::NodeApiRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
