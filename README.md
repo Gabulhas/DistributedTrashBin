@@ -83,16 +83,10 @@ A Database/Node system, where
 - Alongside a Key, Nodes either store a value, or a pointer to another node, and the set of these pointers form the multiple directories.
 
 ## TODO
-- Add a "per pair" mutex, as it's unecessary to lock the whole db if you are only reading a specific key
-- There's no notion of "Waiter" and "Waiter with Request" yet
-  - Even if the node requested a value, and it finally arrived, there should be two instances of the value. One in the Final object, and one in the Database. That way, if a Node is waiting for a value, it receives it, other request for it arrives, it should still have the info, but either notice that the value moved or something
-  - Either that, or we can make the node hold onto the value until the user re-requests the value (if it's stored as Final, we then remove that Final object, return it to the user, and unlock the value)
-  - We should have another table, Key->Peer, where if a Node is waiting for a value, and another request arrives, it should add the peer that asked for the object to that table, and then forward consequent requests to the neighbour peer that made the request arrive.
-- There should a notion of time lock or toggleable lock, where if a some requests a value, it can lock it (make the node hold it) for a while
-
-
 - A node should only "erase" a Value from the db after it's sure that the other one received (not a permissionless network or something, so it's just an Ok response back)
 - Improve locks as when sending the object to the node, we can keep handling other connections
+- there's no way for a node that didn't receive the gossip to ask for the key. maybe they should ask peers or just gossip the message
+- there's some errors with the waiter with request for some reason
 
 # Extra
 

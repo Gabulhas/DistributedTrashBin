@@ -1,4 +1,3 @@
-use crate::network::jobs::JobState;
 use serde::{Deserialize, Serialize};
 use std::error;
 use std::fmt;
@@ -56,18 +55,6 @@ impl fmt::Display for KeyAlreadyExists {
 }
 
 impl error::Error for KeyAlreadyExists {}
-
-impl fmt::Display for JobState {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let s = match self {
-            Self::Waiting => "Waiting",
-            Self::Finished => "Finished",
-            Self::Failed(_) => "Failed",
-        };
-
-        write!(f, "{}", s)
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum DirectorySpecificErrors {

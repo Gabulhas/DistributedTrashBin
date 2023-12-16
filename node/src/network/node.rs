@@ -1,12 +1,12 @@
 use crate::db::{Database, Value};
-use crate::network::communication_types::DirectorySpecificRequest;
+use crate::network::communication_types::ResponseRequestComms;
 use crate::network::communication_types::{
     DirectorySpecificResponse, GetValueResponse, InnerRequestValue, NodeApiRequest,
 };
 use crate::network::errors::{
     DirectorySpecificErrors, KeyAlreadyExists, KeyDoesNotExist, UnexpectedRequest,
 };
-use crate::network::jobs::{Job, JobManager, JobState, WithRequestInfo};
+use crate::network::jobs::{RequestJob, RequestJobManager, RequestJobState, WithRequestInfo};
 use crate::network::node::request_response::ResponseChannel;
 use crate::utils;
 use anyhow::{anyhow, bail};
@@ -31,14 +31,14 @@ struct DirectoryBehaviour {
     kademlia: kad::Behaviour<MemoryStore>,
     ping: ping::Behaviour,
     gossip: gossipsub::Behaviour,
-    request_response: cbor::Behaviour<DirectorySpecificRequest, DirectorySpecificResponse>, // Add other behaviours here
+    request_response: cbor::Behaviour<ResponseRequestComms, DirectorySpecificResponse>, // Add other behaviours here
 }
 
 pub struct Node {
     swarm: libp2p::Swarm<DirectoryBehaviour>,
     database: Box<dyn Database>,
     gossip_topic: IdentTopic,
-    job_manager: JobManager,
+    job_manager: RequestJobManager,
     address: Multiaddr,
 }
 
@@ -60,7 +60,7 @@ impl Node {
             swarm,
             database,
             gossip_topic,
-            job_manager: JobManager {
+            job_manager: RequestJobManager {
                 jobs: HashMap::new(),
             },
             address: local_address,
@@ -100,7 +100,7 @@ impl Node {
         let store = MemoryStore::new(local_peer_id);
         let kademlia = kad::Behaviour::new(local_peer_id, store);
         let request_response =
-            cbor::Behaviour::<DirectorySpecificRequest, DirectorySpecificResponse>::new(
+            cbor::Behaviour::<ResponseRequestComms, DirectorySpecificResponse>::new(
                 [(
                     StreamProtocol::new("/request-response-directory"),
                     ProtocolSupport::Full,
@@ -182,12 +182,7 @@ impl Node {
     async fn handle_kad_event(&mut self, event: kad::Event) -> Result<(), anyhow::Error> {
         match &event {
             kad::Event::OutboundQueryProgressed { result, .. } => {
-                self.print_debug(&format!(
-                    "{} | {}Outbound query progressed: {:?}",
-                    utils::timestamp_now(),
-                    self.swarm.local_peer_id(),
-                    result
-                ));
+                self.print_debug(&format!("Outbound query progressed: {:?}", result));
                 if let kad::QueryResult::GetClosestPeers(Ok(ok)) = result {
                     if ok.peers.is_empty() {
                         bail!("Query finished with no closest peers.")
@@ -252,6 +247,7 @@ impl Node {
                 message,
                 ..
             } => {
+                // change this to a serialization of a specific type
                 let new_key = message.data;
 
                 if let Some(Value::Pointer(_)) = self.database.get(&new_key) {
@@ -313,7 +309,7 @@ impl Node {
                 job
             ));
 
-            job.state = JobState::Finished;
+            job.state = RequestJobState::Finished;
         } else {
             panic!(
                 "Impossible! Received an Ownership from {} for {:?} but didn't have any jobs",
@@ -364,7 +360,7 @@ impl Node {
                         None => {
                             update_job = Some((
                                 key.clone(),
-                                Job {
+                                RequestJob {
                                     state: job_state,
                                     with_request_info: Some(WithRequestInfo {
                                         requester: requester.clone(),
@@ -378,10 +374,10 @@ impl Node {
                             requester: previous_requester,
                             last_peer: previous_last_peer,
                         }) => {
-                            forward_peer = Some(previous_last_peer.clone());
+                            forward_peer = Some(*previous_last_peer);
                             update_job = Some((
                                 key.clone(),
-                                Job {
+                                RequestJob {
                                     state: job_state,
                                     with_request_info: Some(WithRequestInfo {
                                         requester: previous_requester.clone(),
@@ -398,50 +394,12 @@ impl Node {
 
                     match value {
                         Value::Direct(actual_value) => {
-                            let is_connected = self
-                                .swarm
-                                .behaviour_mut()
-                                .request_response
-                                .is_connected(&requester_peer_id);
-
-                            self.print_debug(&format!(
-                                "Received an object request from {} by {} for {:?}, has no job but has the object. is_connected {}",
-                                peer, requester_peer_id, key, is_connected
-                            ));
-
-                            // Initiate connection
-                            self.swarm.dial(requester.clone()).unwrap();
-                            self.print_debug(&format!(
-                                "Trying to connect to {}",
-                                requester.clone()
-                            ));
-
-                            // Continuously check if connected, with a delay between checks
-                            while !self
-                                .swarm
-                                .behaviour()
-                                .request_response
-                                .is_connected(&requester_peer_id)
-                            {
-                                sleep(Duration::from_millis(100)).await; // Adjust the delay duration as needed
-                            }
-
-                            //HERE IT'S SENDING THE OBJECt
-                            let response_id =
-                                self.swarm.behaviour_mut().request_response.send_request(
-                                    &requester_peer_id,
-                                    DirectorySpecificRequest {
-                                        key: key.clone(),
-                                        request_type: InnerRequestValue::ObjectOwnershipSend {
-                                            value: actual_value.clone(),
-                                        },
-                                    },
-                                );
-                            self.print_debug(&format!(
-                                "Sending object to {}. Response ID is {}",
-                                utils::peer_id_from_multiaddr(requester.clone()).unwrap(),
-                                response_id
-                            ));
+                            self.connect_and_send_object(
+                                key.clone(),
+                                actual_value,
+                                requester.clone(),
+                            )
+                            .await;
                         }
                         Value::Pointer(next_peer) => {
                             self.print_debug(&format!(
@@ -470,7 +428,7 @@ impl Node {
                     ));
                     self.swarm.behaviour_mut().request_response.send_request(
                         &next_peer,
-                        DirectorySpecificRequest {
+                        ResponseRequestComms {
                             key: key.clone(),
                             request_type: InnerRequestValue::ObjectRequest { source: requester },
                         },
@@ -494,7 +452,7 @@ impl Node {
 
     async fn handle_request(
         &mut self,
-        request: DirectorySpecificRequest,
+        request: ResponseRequestComms,
         peer: PeerId,
         channel: ResponseChannel<DirectorySpecificResponse>,
     ) -> Result<(), anyhow::Error> {
@@ -517,7 +475,7 @@ impl Node {
     async fn handle_request_response_event(
         &mut self,
         event: request_response::Event<
-            DirectorySpecificRequest,
+            ResponseRequestComms,
             DirectorySpecificResponse,
             DirectorySpecificResponse,
         >,
@@ -597,11 +555,11 @@ impl Node {
         }
     }
 
-    async fn add_new_job(&mut self, key: Vec<u8>) -> JobState {
-        let job_state = JobState::Waiting;
+    async fn start_new_job(&mut self, key: Vec<u8>) -> RequestJobState {
+        let job_state = RequestJobState::Waiting;
         self.job_manager.jobs.insert(
             key,
-            Mutex::new(Job {
+            Mutex::new(RequestJob {
                 state: job_state.clone(),
                 with_request_info: None,
             }),
@@ -609,7 +567,7 @@ impl Node {
         job_state
     }
 
-    async fn start_request_process(&mut self, key: Vec<u8>, next_peer: String) -> JobState {
+    async fn start_request_process(&mut self, key: Vec<u8>, next_peer: String) -> RequestJobState {
         let next_peer = PeerId::from_str(&next_peer).expect("Invalid PeerId format");
         let address_with_peer_id = self
             .address
@@ -618,7 +576,7 @@ impl Node {
             .unwrap();
         self.swarm.behaviour_mut().request_response.send_request(
             &next_peer,
-            DirectorySpecificRequest {
+            ResponseRequestComms {
                 key: key.clone(),
                 request_type: InnerRequestValue::ObjectRequest {
                     source: address_with_peer_id,
@@ -626,7 +584,7 @@ impl Node {
             },
         );
 
-        self.add_new_job(key).await
+        self.start_new_job(key).await
     }
 
     pub async fn get_value(
@@ -637,6 +595,7 @@ impl Node {
         //TODO: Here, if a job entry is final and it's retrieved, we should send the object to the requester (if any) and replace it in the database. If no requester is present, nothing is done
 
         let mut remove_job = false;
+        let mut send_object = None;
 
         let result = match self.job_manager.jobs.get(&key) {
             None => {
@@ -676,7 +635,7 @@ impl Node {
                     // Otherwise, it has either a pending request, a finished request or a failed request
                     // Check if has any peer, and send
                     //LOCK/lock/timelock/value lock
-                    JobState::Finished => {
+                    RequestJobState::Finished => {
                         self.print_debug(
                             "Get Value was executed. Node has the object and job is finished",
                         );
@@ -686,7 +645,7 @@ impl Node {
                             if let Some(Value::Direct(value)) = self.database.get(&key) {
                                 value
                             } else {
-                                panic!("Impossible!")
+                                panic!("Impossible!   ")
                             }
                         };
 
@@ -695,46 +654,61 @@ impl Node {
                             last_peer,
                         }) = &job.with_request_info
                         {
-                            let requester_peer_id =
-                                utils::peer_id_from_multiaddr(requester.clone()).unwrap();
+                            send_object = Some((actual_data.clone(), requester.clone()));
 
-                            self.swarm.dial(requester.clone()).unwrap();
-
-                            // Continuously check if connected, with a delay between checks
-                            while !self
-                                .swarm
-                                .behaviour()
-                                .request_response
-                                .is_connected(&requester_peer_id)
-                            {
-                                sleep(Duration::from_millis(100)).await; // Adjust the delay duration as needed
-                            }
-
-                            self.swarm.behaviour_mut().request_response.send_request(
-                                &requester_peer_id,
-                                DirectorySpecificRequest {
-                                    key: key.clone(),
-                                    request_type: InnerRequestValue::ObjectOwnershipSend {
-                                        value: actual_data.clone(),
-                                    },
-                                },
-                            );
                             self.database
                                 .update(key.clone(), Value::Pointer(last_peer.to_string()));
                         }
 
                         Ok(GetValueResponse::Owner(actual_data))
                     }
-                    JobState::Failed(e) => Err(e.clone()),
-                    JobState::Waiting => Ok(GetValueResponse::Requested(JobState::Waiting)),
+                    RequestJobState::Failed(e) => Err(e.clone()),
+                    RequestJobState::Waiting => {
+                        Ok(GetValueResponse::Requested(RequestJobState::Waiting))
+                    }
                 }
             }
         };
+
+        if let Some((actual_data, requester)) = send_object {
+            self.connect_and_send_object(key.clone(), actual_data, requester)
+                .await;
+        }
 
         if remove_job {
             self.job_manager.jobs.remove(&key);
         }
         result
+    }
+
+    async fn connect_and_send_object(
+        &mut self,
+        key: Vec<u8>,
+        actual_data: Vec<u8>,
+        requester: Multiaddr,
+    ) {
+        let requester_peer_id = utils::peer_id_from_multiaddr(requester.clone()).unwrap();
+
+        self.swarm.dial(requester).unwrap();
+
+        // Continuously check if connected, with a delay between checks
+        while !self
+            .swarm
+            .behaviour()
+            .request_response
+            .is_connected(&requester_peer_id)
+        {
+            sleep(Duration::from_millis(100)).await; // Adjust the delay duration as needed
+            self.print_debug(&format!("Waiting for connection"))
+        }
+
+        self.swarm.behaviour_mut().request_response.send_request(
+            &requester_peer_id,
+            ResponseRequestComms {
+                key,
+                request_type: InnerRequestValue::ObjectOwnershipSend { value: actual_data },
+            },
+        );
     }
 
     fn publish_new_key(&mut self, key: Vec<u8>) {

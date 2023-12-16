@@ -1,5 +1,5 @@
 use crate::network::errors::{DirectorySpecificErrors, KeyAlreadyExists};
-use crate::network::jobs::JobState;
+use crate::network::jobs::RequestJobState;
 use libp2p::Multiaddr;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -11,7 +11,7 @@ pub enum InnerRequestValue {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct DirectorySpecificRequest {
+pub struct ResponseRequestComms {
     pub key: Vec<u8>, //The key used to look up
     pub request_type: InnerRequestValue,
 }
@@ -24,8 +24,8 @@ pub enum DirectorySpecificResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GetValueResponse {
-    Owner(Vec<u8>),      //Either returns the actual value
-    Requested(JobState), //Or returns the job number
+    Owner(Vec<u8>),             //Either returns the actual value
+    Requested(RequestJobState), //Or returns the job number
 }
 
 pub enum NodeApiRequest {
