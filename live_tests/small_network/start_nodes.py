@@ -1,6 +1,11 @@
+from typing import List
 import subprocess
+import threading
 import os
 import glob
+import http.server
+import socketserver
+import json
 import sys
 
 # Directory for the built project and scripts
@@ -8,8 +13,23 @@ folder = "./target/release"
 node_executable = os.path.join(folder, "node")
 utils_executable = os.path.join(folder, "utils")
 key_dir = "live_tests/keys"
+all_nodes = []
 
-# Node class to hold node details
+
+class NodeInfoProvider(http.server.SimpleHTTPRequestHandler):
+
+    def do_GET(self):
+        # Set response status code
+        self.send_response(200)
+
+        # Set headers
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+
+        # Send JSON response
+        response = [x.to_json_dict() for x in all_nodes]
+        print(response)
+        self.wfile.write(json.dumps(response).encode())
 
 
 class Node:
@@ -19,6 +39,13 @@ class Node:
         self.rpc_port = rpc_port
         self.key_file = key_file
         self.process = process
+
+    def to_json_dict(self):
+        return {
+            "port": self.port,
+            "rpc_port": self.rpc_port,
+            "bootstrap": self.key_file != None
+        }
 
 
 def build_multiaddress(keyfile, port):
@@ -75,7 +102,26 @@ def start_additional_nodes(bootnode_count, bootnodes):
     return nodes
 
 
+def run_server_in_thread():
+    PORT = 8000
+    Handler = NodeInfoProvider
+
+    class Server(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    httpd = Server(("", PORT), Handler)
+
+    print(f"Server started at http://localhost:{PORT}")
+
+    server_thread = threading.Thread(target=httpd.serve_forever)
+    server_thread.daemon = True  # Optionally make the server thread a daemon
+    server_thread.start()
+    return server_thread, httpd
+
+
 def main():
+    global all_nodes
+    server_thread, httpd = run_server_in_thread()
     bootnodes, bootnodes_str = initialize_bootnodes()
     regular_nodes = start_additional_nodes(len(bootnodes), bootnodes_str)
     all_nodes = bootnodes + regular_nodes
@@ -83,6 +129,20 @@ def main():
     # Wait for all nodes to finish
     for node in all_nodes:
         node.process.wait()
+
+    try:
+        # Main thread waits for Ctrl+C
+        while server_thread.is_alive():
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("Ctrl+C pressed. Stopping the server...")
+        # Stop the server
+        httpd.shutdown()
+        httpd.server_close()
+        server_thread.join()
+        # Run the custom function
+        [x.process.kill() for x in all_nodes]
 
 
 if __name__ == "__main__":

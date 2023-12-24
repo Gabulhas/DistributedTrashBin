@@ -1,0 +1,4 @@
+new 2 other_value | my value
+allbgwait other_value
+sleep 4
+wait 1 other_value

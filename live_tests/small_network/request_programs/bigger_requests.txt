@@ -1,0 +1,17 @@
+new 2 potato | my value
+get 3 potato
+sleep 1
+
+get 4 potato
+get 5 potato
+get 6 potato
+get 7 potato
+get 8 potato
+bgwait 4 potato
+bgwait 5 potato
+bgwait 6 potato
+bgwait 7 potato
+bgwait 8 potato
+
+sleep 4
+wait 3 potato

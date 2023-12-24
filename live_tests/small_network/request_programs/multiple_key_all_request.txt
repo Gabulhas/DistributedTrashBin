@@ -1,0 +1,22 @@
+new 1 ma1 | value
+new 2 ma2 | value
+new 3 ma3 | value
+new 4 ma4 | value
+new 5 ma5 | value
+new 6 ma6 | value
+sleep 5
+
+allbgwait ma1
+allbgwait ma2
+allbgwait ma3
+allbgwait ma4
+allbgwait ma5
+allbgwait ma6
+sleep 5
+
+wait 1 ma1
+wait 2 ma2
+wait 3 ma3
+wait 4 ma4
+wait 5 ma5
+wait 6 ma6

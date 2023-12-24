@@ -8,31 +8,25 @@ use crate::network::errors::{
 };
 use crate::network::jobs::{RequestJob, RequestJobManager, RequestJobState, WithRequestInfo};
 use crate::network::node::request_response::ResponseChannel;
+use crate::network::swarm_and_libp2p::{
+    initialize_libp2p_stuff, DirectoryBehaviour, DirectoryBehaviourEvent,
+};
 use crate::utils;
 use anyhow::{anyhow, bail};
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic};
-use libp2p::kad::{self, store::MemoryStore};
+use libp2p::kad;
 use libp2p::ping;
-use libp2p::request_response::{self, cbor, Config, ProtocolSupport};
-use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
+use libp2p::request_response::{self};
+use libp2p::swarm::SwarmEvent;
 use libp2p::Multiaddr;
 use libp2p::PeerId;
 use libp2p::{identity, Swarm};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::vec;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-
-#[derive(NetworkBehaviour)]
-struct DirectoryBehaviour {
-    kademlia: kad::Behaviour<MemoryStore>,
-    ping: ping::Behaviour,
-    gossip: gossipsub::Behaviour,
-    request_response: cbor::Behaviour<ResponseRequestComms, DirectorySpecificResponse>, // Add other behaviours here
-}
 
 pub struct Node {
     swarm: libp2p::Swarm<DirectoryBehaviour>,
@@ -50,7 +44,7 @@ impl Node {
         local_address: Multiaddr,
     ) -> Self {
         let (mut swarm, gossip_topic) =
-            Self::initialize_libp2p_stuff(local_key_opt, local_address.clone());
+            initialize_libp2p_stuff(local_key_opt, local_address.clone());
 
         if let Err(e) = Self::add_bootstrap_nodes_to_swarm(&mut swarm, &bootnodes) {
             panic!("{}", e);
@@ -73,76 +67,6 @@ impl Node {
         let jobs_count = self.job_manager.jobs.len();
 
         println!("{timestamp} [Peer ID: {peer_id} | Jobs: {jobs_count}]: {message}");
-    }
-    fn initialize_gossip(keypair: identity::Keypair) -> (gossipsub::Behaviour, IdentTopic) {
-        let config = gossipsub::ConfigBuilder::default()
-            .build()
-            .expect("Valid Gossipsub config");
-
-        let mut gossip = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(keypair.clone()),
-            config,
-        )
-        .expect("Correct Gossipsub instantiation");
-
-        let topic = gossipsub::IdentTopic::new("directory-updates");
-        gossip
-            .subscribe(&topic)
-            .expect("Topic subscription to succeed");
-
-        (gossip, topic)
-    }
-
-    fn initialize_behaviour(
-        local_peer_id: PeerId,
-        gossip: gossipsub::Behaviour,
-    ) -> DirectoryBehaviour {
-        let store = MemoryStore::new(local_peer_id);
-        let kademlia = kad::Behaviour::new(local_peer_id, store);
-        let request_response =
-            cbor::Behaviour::<ResponseRequestComms, DirectorySpecificResponse>::new(
-                [(
-                    StreamProtocol::new("/request-response-directory"),
-                    ProtocolSupport::Full,
-                )],
-                Config::default(),
-            );
-
-        DirectoryBehaviour {
-            kademlia,
-            ping: ping::Behaviour::default(),
-            gossip,
-            request_response,
-        }
-    }
-
-    fn initialize_libp2p_stuff(
-        local_key_opt: Option<identity::Keypair>,
-        local_address: Multiaddr,
-    ) -> (Swarm<DirectoryBehaviour>, IdentTopic) {
-        let local_key = match local_key_opt {
-            Some(local_key) => local_key,
-            None => identity::Keypair::generate_ed25519(),
-        };
-
-        let (gossip, gossip_topic) = Self::initialize_gossip(local_key.clone());
-
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default(),
-                libp2p::tls::Config::new,
-                libp2p::yamux::Config::default,
-            )
-            .unwrap() // Handle this error appropriately
-            .with_behaviour(|key| Self::initialize_behaviour(key.public().to_peer_id(), gossip))
-            .unwrap() // Handle this error appropriately
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
-            .build();
-
-        let _ = swarm.listen_on(local_address);
-
-        (swarm, gossip_topic)
     }
 
     fn add_bootstrap_nodes_to_swarm(
@@ -169,13 +93,6 @@ impl Node {
     }
 
     async fn handle_ping_event(&mut self, _event: ping::Event) -> Result<(), anyhow::Error> {
-        // println!(
-        //
-        //     "{} | {}Ping event {:?}",
-        //     utils::timestamp_now(),
-        //     self.swarm.local_peer_id(),
-        //     event
-        // );
         Ok(())
     }
 
@@ -195,47 +112,26 @@ impl Node {
                     );
                 }
             }
-            //kad::Event::UnroutablePeer { peer } => {
-            //    println!(
-            //        "{} | {}Discovered unroutable peer: {:?}",
-            //        utils::timestamp_now(),
-            //        self.swarm.local_peer_id(),
-            //        peer
-            //    );
-            //}
             kad::Event::RoutingUpdated { peer, .. } => {
                 self.swarm.behaviour_mut().gossip.add_explicit_peer(peer);
+                self.print_debug(&format!("Routing table updated with peer: {:?}", peer));
+            }
+            kad::Event::RoutablePeer { peer, address } => {
+                self.swarm.behaviour_mut().gossip.add_explicit_peer(peer);
+                let _ = self.swarm.dial(address.clone());
+                println!(
+                    "Routable peer discovered: {:?}, address: {:?}",
+                    peer, address
+                );
+            }
+            kad::Event::PendingRoutablePeer { peer, address } => {
+                let _ = self.swarm.dial(address.clone());
                 self.print_debug(&format!(
-                    "{} | {}Routing table updated with peer: {:?}",
-                    utils::timestamp_now(),
-                    self.swarm.local_peer_id(),
-                    peer
+                    "Pending routable peer: {:?}, address: {:?}",
+                    peer, address
                 ));
             }
-            //kad::Event::RoutablePeer { peer, address } => {
-            //    println!(
-            //        "Routable peer discovered: {:?}, address: {:?}",
-            //        peer, address
-            //    );
-            //}
-            //kad::Event::PendingRoutablePeer { peer, address } => {
-            //    println!(
-            //        "{} | {}Pending routable peer: {:?}, address: {:?}",
-            //        utils::timestamp_now(),
-            //        self.swarm.local_peer_id(),
-            //        peer,
-            //        address
-            //    );
-            //}
-            // Log other event types here
-            _ => {
-                //                println!(
-                //                    "{} | {}Other Kademlia event: {:?}",
-                //                    utils::timestamp_now(),
-                //                    self.swarm.local_peer_id(),
-                //                    event
-                //                );
-            }
+            _ => {}
         }
         Ok(())
     }
@@ -699,7 +595,7 @@ impl Node {
             .is_connected(&requester_peer_id)
         {
             sleep(Duration::from_millis(100)).await; // Adjust the delay duration as needed
-            self.print_debug(&format!("Waiting for connection"))
+            self.print_debug("Waiting for connection")
         }
 
         self.swarm.behaviour_mut().request_response.send_request(

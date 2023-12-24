@@ -1,0 +1,9 @@
+-- first test
+new 1 hello | distributed world
+get 1 hello
+sleep 1
+
+get 2 hello
+get 3 hello
+wait 2 hello
+wait 3 hello
