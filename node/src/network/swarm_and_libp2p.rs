@@ -1,4 +1,5 @@
-use crate::network::communication_types::{DirectorySpecificResponse, ResponseRequestComms};
+use crate::network::communication_types::{DirectoryRequest, DirectoryResponse};
+use crate::network::errors::DirectorySpecificErrors;
 use libp2p::gossipsub::{self, IdentTopic};
 use libp2p::identity;
 use libp2p::kad::{self, store::MemoryStore};
@@ -11,12 +12,14 @@ use libp2p::StreamProtocol;
 use libp2p::Swarm;
 use tokio::time::Duration;
 
+pub type DirectoryResponseResult = Result<DirectoryResponse, DirectorySpecificErrors>;
+
 #[derive(NetworkBehaviour)]
 pub struct DirectoryBehaviour {
     pub kademlia: kad::Behaviour<MemoryStore>,
     pub ping: ping::Behaviour,
     pub gossip: gossipsub::Behaviour,
-    pub request_response: cbor::Behaviour<ResponseRequestComms, DirectorySpecificResponse>,
+    pub request_response: cbor::Behaviour<DirectoryRequest, DirectoryResponseResult>,
 }
 
 fn initialize_gossip(keypair: identity::Keypair) -> (gossipsub::Behaviour, IdentTopic) {
@@ -41,7 +44,7 @@ fn initialize_gossip(keypair: identity::Keypair) -> (gossipsub::Behaviour, Ident
 fn initialize_behaviour(local_peer_id: PeerId, gossip: gossipsub::Behaviour) -> DirectoryBehaviour {
     let store = MemoryStore::new(local_peer_id);
     let kademlia = kad::Behaviour::new(local_peer_id, store);
-    let request_response = cbor::Behaviour::<ResponseRequestComms, DirectorySpecificResponse>::new(
+    let request_response = cbor::Behaviour::<DirectoryRequest, DirectoryResponseResult>::new(
         [(
             StreamProtocol::new("/request-response-directory"),
             ProtocolSupport::Full,

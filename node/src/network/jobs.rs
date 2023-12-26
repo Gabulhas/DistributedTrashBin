@@ -5,22 +5,52 @@ use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::Mutex;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SearchingJobState {
+    AskingPeers {
+        peers_asked: usize,
+        negative_responses: usize,
+    },
+    AskingGossip, // This should also ask the peers to gossip.
+    Unknown,      // Can happen that a key actually doesn't exist.
+}
+
+impl fmt::Display for SearchingJobState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "Unknown"),
+            Self::AskingPeers {
+                peers_asked,
+                negative_responses,
+            } => {
+                write!(
+                    f,
+                    "AskingPeers(peers_asked: {}, negative_responses: {})",
+                    peers_asked, negative_responses
+                )
+            }
+            Self::AskingGossip => write!(f, "AskingGossip"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RequestJobState {
     Waiting,
     Finished,
+    SearchingDirection(SearchingJobState),
     Failed(DirectorySpecificErrors),
 }
 
 impl fmt::Display for RequestJobState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let s = match self {
-            Self::Waiting => "Waiting",
-            Self::Finished => "Finished",
-            Self::Failed(_) => "Failed",
-        };
-
-        write!(f, "{}", s)
+        match self {
+            Self::Waiting => write!(f, "Waiting"),
+            Self::Finished => write!(f, "Finished"),
+            Self::Failed(_) => write!(f, "Failed"),
+            Self::SearchingDirection(a) => write!(f, "SearchingDirection({})", a),
+        }
     }
 }
 
@@ -61,15 +91,3 @@ pub struct RequestJobManager {
 }
 
 // Upon receiving a peer with a pointer, for simplicity sake we should make it first store the key with the pointer and then call the get_value function and ignore the result
-pub enum KeySearchingJob {
-    AskingPeers {
-        peers: Vec<PeerId>,
-        negative_responses: u16,
-    },
-    AskingGossip, // This should also ask the peers to gossip.
-    Failed,       // Can happen that a key actually doesn't exist.
-}
-
-pub struct KeySearchingJobManager {
-    pub jobs: HashMap<Vec<u8>, KeySearchingJob>,
-}

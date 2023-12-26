@@ -1,15 +1,15 @@
 use crate::db::{Database, Value};
-use crate::network::communication_types::ResponseRequestComms;
 use crate::network::communication_types::{
-    DirectorySpecificResponse, GetValueResponse, InnerRequestValue, NodeApiRequest,
+    DirectoryRequest, DirectoryResponse, GetValueResponse, InnerRequestValue, InnerResponseValue,
+    NodeApiRequest,
 };
-use crate::network::errors::{
-    DirectorySpecificErrors, KeyAlreadyExists, KeyDoesNotExist, UnexpectedRequest,
+use crate::network::errors::{DirectorySpecificErrors, KeyAlreadyExists, UnexpectedRequest};
+use crate::network::jobs::{
+    RequestJob, RequestJobManager, RequestJobState, SearchingJobState, WithRequestInfo,
 };
-use crate::network::jobs::{RequestJob, RequestJobManager, RequestJobState, WithRequestInfo};
 use crate::network::node::request_response::ResponseChannel;
 use crate::network::swarm_and_libp2p::{
-    initialize_libp2p_stuff, DirectoryBehaviour, DirectoryBehaviourEvent,
+    initialize_libp2p_stuff, DirectoryBehaviour, DirectoryBehaviourEvent, DirectoryResponseResult,
 };
 use crate::utils;
 use anyhow::{anyhow, bail};
@@ -143,7 +143,8 @@ impl Node {
                 message,
                 ..
             } => {
-                // change this to a serialization of a specific type
+                //TODO in case there was a searching key job previously, delete it and re-execute the "get_value" function to ask for the key
+
                 let new_key = message.data;
 
                 if let Some(Value::Pointer(_)) = self.database.get(&new_key) {
@@ -163,7 +164,7 @@ impl Node {
         &mut self,
         key: Vec<u8>,
         value: Vec<u8>,
-        channel: ResponseChannel<DirectorySpecificResponse>,
+        channel: ResponseChannel<DirectoryResponseResult>,
         peer: PeerId,
     ) -> Result<(), anyhow::Error> {
         // ...
@@ -180,7 +181,7 @@ impl Node {
                           peer,
                           key.clone()
                         ));
-                DirectorySpecificResponse::Err(DirectorySpecificErrors::UnexpectedRequest(
+                Err(DirectorySpecificErrors::UnexpectedRequest(
                     UnexpectedRequest { key: key.clone() },
                 ))
             }
@@ -193,7 +194,10 @@ impl Node {
 
                 self.database.update(key.clone(), Value::Direct(value));
 
-                DirectorySpecificResponse::Ok
+                Ok(DirectoryResponse {
+                    key: key.clone(),
+                    response_type: InnerResponseValue::ReceivedIncomingRequest,
+                })
             }
         };
 
@@ -225,7 +229,7 @@ impl Node {
         &mut self,
         key: Vec<u8>,
         requester: Multiaddr,
-        channel: ResponseChannel<DirectorySpecificResponse>,
+        channel: ResponseChannel<DirectoryResponseResult>,
         peer: PeerId,
     ) -> Result<(), anyhow::Error> {
         let mut update_job = None;
@@ -324,7 +328,7 @@ impl Node {
                     ));
                     self.swarm.behaviour_mut().request_response.send_request(
                         &next_peer,
-                        ResponseRequestComms {
+                        DirectoryRequest {
                             key: key.clone(),
                             request_type: InnerRequestValue::ObjectRequest { source: requester },
                         },
@@ -334,7 +338,13 @@ impl Node {
                 self.swarm
                     .behaviour_mut()
                     .request_response
-                    .send_response(channel, DirectorySpecificResponse::Ok)
+                    .send_response(
+                        channel,
+                        Ok(DirectoryResponse {
+                            key: key.clone(),
+                            response_type: InnerResponseValue::ReceivedIncomingRequest,
+                        }),
+                    )
                     .map_err(|e| anyhow!("Error sending response: {:?}", e))?;
 
                 if update_database_pointer {
@@ -346,11 +356,32 @@ impl Node {
         }
     }
 
+    async fn handle_key_search_request(
+        &mut self,
+        key: Vec<u8>,
+        _peer: PeerId,
+        channel: ResponseChannel<DirectoryResponseResult>,
+    ) -> Result<(), anyhow::Error> {
+        self.swarm
+            .behaviour_mut()
+            .request_response
+            .send_response(
+                channel,
+                Ok(DirectoryResponse {
+                    key: key.clone(),
+                    response_type: InnerResponseValue::IsKeyFound(
+                        self.database.get(&key).is_some(),
+                    ),
+                }),
+            )
+            .map_err(|e| anyhow!("Error sending response: {:?}", e))
+    }
+
     async fn handle_request(
         &mut self,
-        request: ResponseRequestComms,
+        request: DirectoryRequest,
         peer: PeerId,
-        channel: ResponseChannel<DirectorySpecificResponse>,
+        channel: ResponseChannel<DirectoryResponseResult>,
     ) -> Result<(), anyhow::Error> {
         match request.request_type {
             InnerRequestValue::ObjectRequest { source } => {
@@ -365,16 +396,95 @@ impl Node {
                 self.handle_object_ownership_send(request.key, value, channel, peer)
                     .await
             }
+            InnerRequestValue::KeySearch => {
+                self.print_debug(&format!(
+                    "Received a Key Serach Request from {:?} for key {:?}",
+                    peer, request.key
+                ));
+                self.handle_key_search_request(request.key, peer, channel)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_is_key_found_response(
+        &mut self,
+        key: Vec<u8>,
+        peer: PeerId,
+        is_found: bool,
+    ) -> Result<(), anyhow::Error> {
+        let ask_gossip;
+        {
+            // Limiting the scope of the job_lock
+            let job_lock = match self.job_manager.jobs.get(&key) {
+                Some(job) => job,
+                None => return Ok(()),
+            };
+
+            // Lock the job and access its state
+            let mut job = job_lock.lock().await;
+            ask_gossip = if let RequestJobState::SearchingDirection(search_state) = &mut job.state {
+                if is_found {
+                    self.database
+                        .insert(key.clone(), Value::Pointer(peer.to_string()));
+
+                    // If key is found, proceed to get value
+                    drop(job); // Explicitly drop the lock before the await point
+                    return match self.get_value(key).await {
+                        Ok(_) => Ok(()),
+                        Err(a) => Err(anyhow::Error::msg(a.to_string())),
+                    };
+                } else {
+                    // Update state for negative response
+                    if let SearchingJobState::AskingPeers {
+                        ref mut negative_responses,
+                        peers_asked,
+                    } = search_state
+                    {
+                        *negative_responses += 1;
+                        *negative_responses >= *peers_asked
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+        } // job is dropped here, ending the immutable borrow
+
+        // ask_gossip is now used outside the scope of the job borrow
+        if ask_gossip {
+            self.ask_gossip_for_key(key); // Assuming this is an async function
+        }
+
+        Ok(())
+    }
+
+    async fn handle_response(
+        &mut self,
+        response: DirectoryResponseResult,
+        peer: PeerId,
+    ) -> Result<(), anyhow::Error> {
+        let inner = match response {
+            Err(a) => {
+                // Convert DirectorySpecificErrors to a string and then to anyhow::Error
+                return Err(anyhow::Error::msg(a.to_string()));
+            }
+            Ok(inner) => inner,
+        };
+
+        match inner.response_type {
+            InnerResponseValue::ReceivedIncomingRequest => Ok(()),
+            InnerResponseValue::IsKeyFound(is_found) => {
+                self.handle_is_key_found_response(inner.key, peer, is_found)
+                    .await
+            }
         }
     }
 
     async fn handle_request_response_event(
         &mut self,
-        event: request_response::Event<
-            ResponseRequestComms,
-            DirectorySpecificResponse,
-            DirectorySpecificResponse,
-        >,
+        event: request_response::Event<DirectoryRequest, DirectoryResponseResult>,
     ) -> Result<(), anyhow::Error> {
         match event {
             request_response::Event::Message { message, peer } => {
@@ -387,7 +497,7 @@ impl Node {
                         request_id,
                     } => {
                         self.print_debug(&format!("Reponse {:?} with ID {}", response, request_id));
-                        Ok(())
+                        self.handle_response(response, peer).await
                     }
                 }
             } // Handle other event types if necessary
@@ -404,7 +514,8 @@ impl Node {
     ) -> Result<(), anyhow::Error> {
         loop {
             tokio::select! {
-                // Handle network events
+              //TODO: any even shouldn't block the loop
+
                 event = self.swarm.select_next_some() => match event {
                     SwarmEvent::NewListenAddr { address, .. } => self.print_debug(&format!("Listening on {:?}", address)),
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => self.print_debug(&format!("Connection established with peer: {:?}", peer_id)),
@@ -472,7 +583,7 @@ impl Node {
             .unwrap();
         self.swarm.behaviour_mut().request_response.send_request(
             &next_peer,
-            ResponseRequestComms {
+            DirectoryRequest {
                 key: key.clone(),
                 request_type: InnerRequestValue::ObjectRequest {
                     source: address_with_peer_id,
@@ -483,12 +594,55 @@ impl Node {
         self.start_new_job(key).await
     }
 
+    async fn find_key_direction_peers(
+        &mut self,
+        key: Vec<u8>,
+    ) -> Result<SearchingJobState, DirectorySpecificErrors> {
+        // This is used in case a node doens't know about a key (yet)
+        // TODO: add something about when a key is not yet added but receives a key gossipfrom the network
+        // imagine that a new key was added on A, and a user asked node B for that key, yet the gossip hasn't reached node B
+        // we should cancel the find_key_direction_peers job
+        // Also, do something for when a node is looking for the direction but receives a request too. Maybe, the node that just creates a "waiting" request
+
+        //Ask Peers -> Gossip -> Assume it doens't exist
+        let job_state = SearchingJobState::AskingPeers {
+            peers_asked: self.swarm.connected_peers().count(),
+            negative_responses: 0,
+        };
+
+        self.job_manager.jobs.insert(
+            key.clone(),
+            Mutex::new(RequestJob {
+                state: RequestJobState::SearchingDirection(job_state.clone()),
+                with_request_info: None,
+            }),
+        );
+
+        let peer_ids: Vec<_> = self.swarm.connected_peers().cloned().collect();
+
+        for peer_id in peer_ids {
+            let request = DirectoryRequest {
+                key: key.clone(),
+                request_type: InnerRequestValue::KeySearch,
+            };
+
+            // Mutable borrow of `self.swarm` is now allowed
+            self.swarm
+                .behaviour_mut()
+                .request_response
+                .send_request(&peer_id, request);
+        }
+
+        //TODO: Create a timeout to then gossip and cancel the peer asking
+
+        Ok(job_state)
+    }
+
     pub async fn get_value(
         &mut self,
         key: Vec<u8>,
     ) -> Result<GetValueResponse, DirectorySpecificErrors> {
         // Clone the key for immutable borrow and limit the scope of the borrow
-        //TODO: Here, if a job entry is final and it's retrieved, we should send the object to the requester (if any) and replace it in the database. If no requester is present, nothing is done
 
         let mut remove_job = false;
         let mut send_object = None;
@@ -499,11 +653,14 @@ impl Node {
 
                 let next_peer = {
                     match self.database.get(&key) {
-                        None => {
-                            return Err(DirectorySpecificErrors::KeyDoesNotExist(KeyDoesNotExist {
-                                key,
-                            }))
-                        }
+                        None => match self.find_key_direction_peers(key).await {
+                            Ok(a) => {
+                                return Ok(GetValueResponse::Requested(
+                                    RequestJobState::SearchingDirection(a),
+                                ))
+                            }
+                            Err(e) => return Err(e),
+                        },
                         Some(Value::Direct(value)) => {
                             self.print_debug(
                                 "Get Value was executed. Node has the object. Sending directly.",
@@ -519,7 +676,6 @@ impl Node {
                     next_peer
                 ));
                 let job_state = self.start_request_process(key.clone(), next_peer).await;
-                //TODO: there's something to do here I bet
                 Ok(GetValueResponse::Requested(job_state))
             }
 
@@ -541,7 +697,7 @@ impl Node {
                             if let Some(Value::Direct(value)) = self.database.get(&key) {
                                 value
                             } else {
-                                panic!("Impossible!   ")
+                                panic!("Impossible!")
                             }
                         };
 
@@ -561,6 +717,14 @@ impl Node {
                     RequestJobState::Failed(e) => Err(e.clone()),
                     RequestJobState::Waiting => {
                         Ok(GetValueResponse::Requested(RequestJobState::Waiting))
+                    }
+                    RequestJobState::SearchingDirection(a) => {
+                        todo!(
+                            "{}",
+                            &format!(
+                            "Someone Requested a key I'm looking for. Current state of search {}"
+                        , a.clone())
+                        )
                     }
                 }
             }
@@ -587,7 +751,6 @@ impl Node {
 
         self.swarm.dial(requester).unwrap();
 
-        // Continuously check if connected, with a delay between checks
         while !self
             .swarm
             .behaviour()
@@ -600,7 +763,7 @@ impl Node {
 
         self.swarm.behaviour_mut().request_response.send_request(
             &requester_peer_id,
-            ResponseRequestComms {
+            DirectoryRequest {
                 key,
                 request_type: InnerRequestValue::ObjectOwnershipSend { value: actual_data },
             },
@@ -608,6 +771,16 @@ impl Node {
     }
 
     fn publish_new_key(&mut self, key: Vec<u8>) {
+        let topic = self.gossip_topic.clone();
+
+        self.swarm
+            .behaviour_mut()
+            .gossip
+            .publish(topic, key)
+            .unwrap();
+    }
+
+    fn ask_gossip_for_key(&mut self, key: Vec<u8>) {
         let topic = self.gossip_topic.clone();
 
         self.swarm
@@ -632,7 +805,7 @@ impl Node {
             None => self.database.insert(key.clone(), Value::Direct(value)),
             Some(_) => return Err(KeyAlreadyExists { key }),
         }
-        self.publish_new_key(key); //TODO handle this error
+        self.publish_new_key(key);
         Ok(())
     }
 }

@@ -8,18 +8,25 @@ use tokio::sync::mpsc;
 pub enum InnerRequestValue {
     ObjectRequest { source: Multiaddr },
     ObjectOwnershipSend { value: Vec<u8> },
+    KeySearch,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ResponseRequestComms {
+pub struct DirectoryRequest {
     pub key: Vec<u8>, //The key used to look up
     pub request_type: InnerRequestValue,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum DirectorySpecificResponse {
-    Ok,
-    Err(DirectorySpecificErrors),
+pub enum InnerResponseValue {
+    ReceivedIncomingRequest,
+    IsKeyFound(bool),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DirectoryResponse {
+    pub key: Vec<u8>,
+    pub response_type: InnerResponseValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
