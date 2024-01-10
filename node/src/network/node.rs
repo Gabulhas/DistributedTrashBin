@@ -1,9 +1,11 @@
-use crate::db::{Database, Value};
+use crate::db::{handler::Handler as DatabaseHandler, Database, Value};
 use crate::network::communication_types::{
     DirectoryRequest, DirectoryResponse, GetValueResponse, InnerRequestValue, InnerResponseValue,
     NodeApiRequest,
 };
-use crate::network::errors::{DirectorySpecificErrors, KeyAlreadyExists, UnexpectedRequest};
+use crate::network::errors::{
+    DirectorySpecificErrors, KeyAlreadyExists, KeyDoesNotExist, UnexpectedRequest,
+};
 use crate::network::jobs::{
     RequestJob, RequestJobManager, RequestJobState, SearchingJobState, WithRequestInfo,
 };
@@ -30,7 +32,7 @@ use tokio::time::{sleep, Duration};
 
 pub struct Node {
     swarm: libp2p::Swarm<DirectoryBehaviour>,
-    database: Box<dyn Database>,
+    database_handler: DatabaseHandler,
     gossip_topic: IdentTopic,
     job_manager: RequestJobManager,
     address: Multiaddr,
@@ -52,7 +54,7 @@ impl Node {
 
         Node {
             swarm,
-            database,
+            database_handler: DatabaseHandler::new(database),
             gossip_topic,
             job_manager: RequestJobManager {
                 jobs: HashMap::new(),
@@ -147,11 +149,11 @@ impl Node {
 
                 let new_key = message.data;
 
-                if let Some(Value::Pointer(_)) = self.database.get(&new_key) {
+                if let Some(Value::Pointer(_)) = self.database_handler.get(new_key.clone()).await {
                     Ok(())
                 } else {
                     self.print_debug(&format!("Was told about a new key {:?}", new_key.clone()));
-                    self.database
+                    self.database_handler
                         .insert(new_key, Value::Pointer(propagation_source.to_string()));
                     Ok(())
                 }
@@ -174,7 +176,7 @@ impl Node {
             peer,
             key.clone()
         ));
-        let response = match self.database.get(&key) {
+        let response = match self.database_handler.get(key.clone()).await {
             None => {
                 self.print_debug(&format!(
                           "Invalid OnwershipSend received from {} for key {:?}: Key not found in database",
@@ -192,7 +194,8 @@ impl Node {
                     key.clone()
                 ));
 
-                self.database.update(key.clone(), Value::Direct(value));
+                self.database_handler
+                    .update(key.clone(), Value::Direct(value));
 
                 Ok(DirectoryResponse {
                     key: key.clone(),
@@ -237,7 +240,7 @@ impl Node {
         let mut update_database_pointer = false;
         let requester_peer_id = utils::peer_id_from_multiaddr(requester.clone()).unwrap();
 
-        match self.database.get(&key) {
+        match self.database_handler.get(key.clone()).await {
             None => {
                 // Implement logic for None case
                 // here we can force the nodes that don't know about the key yet, to become a requester
@@ -348,7 +351,8 @@ impl Node {
                     .map_err(|e| anyhow!("Error sending response: {:?}", e))?;
 
                 if update_database_pointer {
-                    self.database.update(key, Value::Pointer(peer.to_string()));
+                    self.database_handler
+                        .update(key, Value::Pointer(peer.to_string()));
                 }
 
                 Ok(())
@@ -370,7 +374,7 @@ impl Node {
                 Ok(DirectoryResponse {
                     key: key.clone(),
                     response_type: InnerResponseValue::IsKeyFound(
-                        self.database.get(&key).is_some(),
+                        self.database_handler.get(key.clone()).await.is_some(),
                     ),
                 }),
             )
@@ -425,7 +429,7 @@ impl Node {
             let mut job = job_lock.lock().await;
             ask_gossip = if let RequestJobState::SearchingDirection(search_state) = &mut job.state {
                 if is_found {
-                    self.database
+                    self.database_handler
                         .insert(key.clone(), Value::Pointer(peer.to_string()));
 
                     // If key is found, proceed to get value
@@ -594,6 +598,30 @@ impl Node {
         self.start_new_job(key).await
     }
 
+    async fn start_timeout_thread_for_peer_asking(&mut self, key: Vec<u8>) {
+        let job_opt = self.job_manager.jobs.get(&key);
+
+        tokio::spawn(async {
+            Duration::from_secs(10);
+            // Limiting the scope of the job_lock
+            let job_lock = match job_opt {
+                Some(job) => job,
+                None => return,
+            };
+
+            // Lock the job and access its state
+            let mut job = job_lock.lock().await;
+            match job.state {
+                RequestJobState::SearchingDirection(SearchingJobState::AskingPeers { .. }) => {
+                    job.state = RequestJobState::Failed(DirectorySpecificErrors::KeyDoesNotExist(
+                        KeyDoesNotExist { key: key.clone() },
+                    ));
+                }
+                _ => return,
+            }
+        });
+    }
+
     async fn find_key_direction_peers(
         &mut self,
         key: Vec<u8>,
@@ -652,7 +680,7 @@ impl Node {
                 // If it has no job related to this, either the node already has the key, or has to request iti
 
                 let next_peer = {
-                    match self.database.get(&key) {
+                    match self.database_handler.get(key.clone()).await {
                         None => match self.find_key_direction_peers(key).await {
                             Ok(a) => {
                                 return Ok(GetValueResponse::Requested(
@@ -694,7 +722,9 @@ impl Node {
                         remove_job = true;
 
                         let actual_data = {
-                            if let Some(Value::Direct(value)) = self.database.get(&key) {
+                            if let Some(Value::Direct(value)) =
+                                self.database_handler.get(key.clone()).await
+                            {
                                 value
                             } else {
                                 panic!("Impossible!")
@@ -708,8 +738,9 @@ impl Node {
                         {
                             send_object = Some((actual_data.clone(), requester.clone()));
 
-                            self.database
-                                .update(key.clone(), Value::Pointer(last_peer.to_string()));
+                            self.database_handler
+                                .update(key.clone(), Value::Pointer(last_peer.to_string()))
+                                .await;
                         }
 
                         Ok(GetValueResponse::Owner(actual_data))
@@ -801,8 +832,12 @@ impl Node {
             value.clone()
         ));
 
-        match self.database.get(&key) {
-            None => self.database.insert(key.clone(), Value::Direct(value)),
+        match self.database_handler.get(key.clone()).await {
+            None => {
+                self.database_handler
+                    .insert(key.clone(), Value::Direct(value))
+                    .await
+            }
             Some(_) => return Err(KeyAlreadyExists { key }),
         }
         self.publish_new_key(key);

@@ -11,6 +11,8 @@ pub use memory::InMemoryDatabase;
 
 // Implement the trait for the exported structs
 
+pub mod handler;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum Value {
     Direct(Vec<u8>), // Direct value
