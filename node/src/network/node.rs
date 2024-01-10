@@ -14,6 +14,7 @@ use crate::network::swarm_and_libp2p::{
     initialize_libp2p_stuff, DirectoryBehaviour, DirectoryBehaviourEvent, DirectoryResponseResult,
 };
 use crate::utils;
+use crate::utils::async_store_handler::{AsyncHandler, GenericAsyncHandler};
 use anyhow::{anyhow, bail};
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic};
@@ -26,6 +27,7 @@ use libp2p::PeerId;
 use libp2p::{identity, Swarm};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
@@ -51,6 +53,8 @@ impl Node {
         if let Err(e) = Self::add_bootstrap_nodes_to_swarm(&mut swarm, &bootnodes) {
             panic!("{}", e);
         }
+        let db_storage = Arc::new(Mutex::new(HashMap::<Vec<u8>, Value>::new()));
+        let db_handler = GenericAsyncHandler::<Vec<u8>, Value, Box<dyn Database>>::new(db_storage);
 
         Node {
             swarm,
@@ -599,10 +603,11 @@ impl Node {
     }
 
     async fn start_timeout_thread_for_peer_asking(&mut self, key: Vec<u8>) {
-        let job_opt = self.job_manager.jobs.get(&key);
+        let job_opt = self.job_manager.jobs.get(&key).clone();
 
-        tokio::spawn(async {
-            Duration::from_secs(10);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10));
+
             // Limiting the scope of the job_lock
             let job_lock = match job_opt {
                 Some(job) => job,
