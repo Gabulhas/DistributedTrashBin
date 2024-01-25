@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use std::future::Future;
 use std::pin::Pin;
 
-pub trait AsyncHandler<K, V, S: Storage<K, V> + Send + Sync> {
+pub trait AsyncHandler<K, V, S: Storage<K, V> + Send + Sync + ?Sized> {
     fn new(storage: Arc<S>) -> Self
     where
         Self: Sized;
@@ -15,11 +15,10 @@ pub trait AsyncHandler<K, V, S: Storage<K, V> + Send + Sync> {
     fn delete(&self, key: K) -> Pin<Box<dyn Future<Output = Option<V>> + Send>>;
 }
 
-pub trait Storage<K, V> {
-    fn insert(&mut self, key: K, value: V) -> Option<V>;
-    fn get(&self, key: &K) -> Option<&V>;
-    fn remove(&mut self, key: &K) -> Option<V>;
-    // Add update method if needed
+pub trait Storage<K, V>: Send + Sync {
+    fn insert(&self, key: K, value: V) -> Option<V>;
+    fn get(&self, key: &K) -> Option<V>;
+    fn remove(&self, key: &K) -> Option<V>;
 }
 
 // Handler action enum
@@ -32,17 +31,17 @@ pub enum HandlerAction<K, V> {
 
 pub struct GenericAsyncHandler<K, V, S>
 where
-    S: Storage<K, V> + Send + Sync,
+    S: Storage<K, V> + ?Sized,
 {
     storage: Arc<S>,
     tx: mpsc::Sender<HandlerAction<K, V>>,
 }
 
-impl<K, V, S> AsyncHandler<K, V, S> for GenericAsyncHandler<K, V, S>
+impl<K, V, S: ?Sized> AsyncHandler<K, V, S> for GenericAsyncHandler<K, V, S>
 where
     K: Send + Clone + 'static,
     V: Send + Clone + 'static,
-    S: Storage<K, V> + Send + Sync + 'static,
+    S: Storage<K, V> + 'static,
 {
     fn new(storage: Arc<S>) -> Self {
         let (tx, mut rx) = mpsc::channel::<HandlerAction<K, V>>(32);

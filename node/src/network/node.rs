@@ -53,9 +53,12 @@ impl Node {
         if let Err(e) = Self::add_bootstrap_nodes_to_swarm(&mut swarm, &bootnodes) {
             panic!("{}", e);
         }
-        let db_storage = Arc::new(Mutex::new(HashMap::<Vec<u8>, Value>::new()));
-        let db_handler = GenericAsyncHandler::<Vec<u8>, Value, Box<dyn Database>>::new(db_storage);
+        // Convert Box<dyn Database> to Arc<dyn Database>
+        let arc_database: Arc<dyn Database> = Arc::from(database);
 
+        // Instantiate the GenericAsyncHandler with Arc<dyn Database>
+        let db_handler: GenericAsyncHandler<Vec<u8>, Value, Arc<dyn Database>> =
+            GenericAsyncHandler::new(arc_database.clone().into());
         Node {
             swarm,
             database_handler: DatabaseHandler::new(database),

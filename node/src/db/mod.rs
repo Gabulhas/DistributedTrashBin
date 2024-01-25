@@ -1,4 +1,6 @@
+use crate::utils::async_store_handler::Storage;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub mod memory;
 // pub mod disk;
@@ -46,7 +48,7 @@ pub enum DatabaseType {
     //Disk(DiskDatabase),
 }
 
-pub trait Database: Send {
+pub trait Database: Send + Sync {
     fn get(&self, key: &[u8]) -> Option<Value>;
     fn insert(&mut self, key: Vec<u8>, value: Value);
     fn delete(&mut self, key: &[u8]) -> Option<Value>;
@@ -90,5 +92,24 @@ impl DatabaseType {
             panic!("Not implemented yet")
             // Box::new(DatabaseType::Disk(DiskDatabase::new("path/to/db/file")))
         }
+    }
+}
+
+impl<K, V> Storage<K, V> for Arc<dyn Database>
+where
+    K: AsRef<[u8]> + Send + Sync,
+    V: From<Value> + Into<Value> + Send + Sync,
+{
+    fn get(&self, key: &K) -> Option<V> {
+        self.as_ref().get(key.as_ref()).map(V::from)
+    }
+
+    fn insert(&self, key: K, value: V) -> Option<V> {
+        self.as_ref().insert(key.as_ref().to_vec(), value.into());
+        self.get(&key)
+    }
+
+    fn remove(&self, key: &K) -> Option<V> {
+        self.as_ref().delete(key.as_ref()).map(V::from)
     }
 }
