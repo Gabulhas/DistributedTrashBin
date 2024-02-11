@@ -1,19 +1,16 @@
 use crate::db::{Database, Value};
 use tokio::sync::mpsc;
 
+/*
+   THIS IS STILL BLOCKING; SYNCRONOUS; SAME THING AS JUST HAVING A MUTEX TO ACCESS THE DATABASE
+   LATER THIS SHALL BE USED CONCURRENTLY READ AND WRITE FROM THE DATABASE
+*/
+
 pub struct Handler {
     database: Box<dyn Database>,
     rx: mpsc::Receiver<Action>,
     pub tx: mpsc::Sender<Action>,
 }
-
-/*
-    fn get(&self, key: &[u8]) -> Option<Value>;
-    fn insert(&mut self, key: Vec<u8>, value: Value);
-    fn delete(&mut self, key: &[u8]) -> Option<Value>;
-    fn update(&mut self, key: Vec<u8>, value: Value) -> Option<Value>;
-
-*/
 
 pub enum ActionType {
     Get(mpsc::Sender<Option<Value>>),

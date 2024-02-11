@@ -1,5 +1,3 @@
-pub mod async_store_handler;
-
 use chrono::Local;
 use libp2p::identity::{self, Keypair};
 use libp2p::multiaddr::Protocol;

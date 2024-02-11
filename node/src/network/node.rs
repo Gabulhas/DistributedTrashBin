@@ -14,8 +14,8 @@ use crate::network::swarm_and_libp2p::{
     initialize_libp2p_stuff, DirectoryBehaviour, DirectoryBehaviourEvent, DirectoryResponseResult,
 };
 use crate::utils;
-use crate::utils::async_store_handler::{AsyncHandler, GenericAsyncHandler};
 use anyhow::{anyhow, bail};
+use dashmap::DashMap;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic};
 use libp2p::kad;
@@ -25,7 +25,6 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::Multiaddr;
 use libp2p::PeerId;
 use libp2p::{identity, Swarm};
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -36,7 +35,7 @@ pub struct Node {
     swarm: libp2p::Swarm<DirectoryBehaviour>,
     database_handler: DatabaseHandler,
     gossip_topic: IdentTopic,
-    job_manager: RequestJobManager,
+    job_manager: Arc<RequestJobManager>,
     address: Multiaddr,
 }
 
@@ -53,19 +52,20 @@ impl Node {
         if let Err(e) = Self::add_bootstrap_nodes_to_swarm(&mut swarm, &bootnodes) {
             panic!("{}", e);
         }
-        // Convert Box<dyn Database> to Arc<dyn Database>
-        let arc_database: Arc<dyn Database> = Arc::from(database);
 
-        // Instantiate the GenericAsyncHandler with Arc<dyn Database>
-        let db_handler: GenericAsyncHandler<Vec<u8>, Value, Arc<dyn Database>> =
-            GenericAsyncHandler::new(arc_database.clone().into());
+        let database_handler = DatabaseHandler::new(database);
+
+        tokio::spawn(async move {
+            database_handler.start().await;
+        });
+
         Node {
             swarm,
-            database_handler: DatabaseHandler::new(database),
+            database_handler,
             gossip_topic,
-            job_manager: RequestJobManager {
-                jobs: HashMap::new(),
-            },
+            job_manager: Arc::new(RequestJobManager {
+                jobs: DashMap::new(),
+            }),
             address: local_address,
         }
     }
@@ -246,6 +246,7 @@ impl Node {
         let mut forward_peer = None; // this is the peer we should first forward to before changing our current link
         let mut update_database_pointer = false;
         let requester_peer_id = utils::peer_id_from_multiaddr(requester.clone()).unwrap();
+        let job_manager = self.job_manager.clone();
 
         match self.database_handler.get(key.clone()).await {
             None => {
@@ -256,7 +257,7 @@ impl Node {
             Some(value) => {
                 //If the Node that received a request is either waiting or just received the object (some client asked the node for it, and node is still waiting for that client to refetch)
 
-                if let Some(job) = self.job_manager.jobs.get(&key) {
+                if let Some(job) = job_manager.jobs.get(&key) {
                     let job = job.lock().await;
                     let job_state = job.state.clone();
 
@@ -425,9 +426,10 @@ impl Node {
         is_found: bool,
     ) -> Result<(), anyhow::Error> {
         let ask_gossip;
+        let job_manager = self.job_manager.clone();
         {
             // Limiting the scope of the job_lock
-            let job_lock = match self.job_manager.jobs.get(&key) {
+            let job_lock = match job_manager.jobs.get(&key) {
                 Some(job) => job,
                 None => return Ok(()),
             };
@@ -605,20 +607,21 @@ impl Node {
         self.start_new_job(key).await
     }
 
-    async fn start_timeout_thread_for_peer_asking(&mut self, key: Vec<u8>) {
-        let job_opt = self.job_manager.jobs.get(&key).clone();
-
+    async fn start_timeout_thread_for_peer_asking(
+        &mut self,
+        key: Vec<u8>,
+        job_to_timeout: Mutex<RequestJob>,
+    ) -> Option<()> {
+        // HMMMMM
+        let job_manager = self.job_manager.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10));
-
-            // Limiting the scope of the job_lock
-            let job_lock = match job_opt {
-                Some(job) => job,
-                None => return,
-            };
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if !job_manager.jobs.contains_key(&key) {
+                return;
+            }
 
             // Lock the job and access its state
-            let mut job = job_lock.lock().await;
+            let mut job = job_to_timeout.lock().await;
             match job.state {
                 RequestJobState::SearchingDirection(SearchingJobState::AskingPeers { .. }) => {
                     job.state = RequestJobState::Failed(DirectorySpecificErrors::KeyDoesNotExist(
@@ -628,6 +631,7 @@ impl Node {
                 _ => return,
             }
         });
+        Some(())
     }
 
     async fn find_key_direction_peers(
@@ -682,8 +686,9 @@ impl Node {
 
         let mut remove_job = false;
         let mut send_object = None;
+        let job_manager = self.job_manager.clone();
 
-        let result = match self.job_manager.jobs.get(&key) {
+        let result = match job_manager.jobs.get(&key) {
             None => {
                 // If it has no job related to this, either the node already has the key, or has to request iti
 

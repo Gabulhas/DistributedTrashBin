@@ -1,12 +1,10 @@
 use crate::network::errors::DirectorySpecificErrors;
-use crate::utils::async_store_handler::Storage;
 use core::fmt;
+use dashmap::DashMap;
 use libp2p::Multiaddr;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tokio::sync::Mutex;
-use tokio::sync::MutexGuard;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SearchingJobState {
@@ -89,26 +87,5 @@ pub struct RequestJob {
 }
 
 pub struct RequestJobManager {
-    pub jobs: HashMap<Vec<u8>, Mutex<RequestJob>>,
+    pub jobs: DashMap<Vec<u8>, Mutex<RequestJob>>,
 }
-
-impl Storage<Vec<u8>, MutexGuard<'_, RequestJob>> for RequestJobManager {
-    fn get(&self, key: &Vec<u8>) -> Option<MutexGuard<RequestJob>> {
-        self.jobs.get(key)?.try_lock().ok()
-    }
-
-    fn insert(&mut self, key: Vec<u8>, value: RequestJob) -> Option<MutexGuard<RequestJob>> {
-        let mut job = self.jobs.entry(key).or_insert_with(|| Mutex::new(value));
-        Some(job.lock().unwrap()) // Consider handling lock poisoning
-    }
-
-    fn remove(&mut self, key: &Vec<u8>) -> Option<MutexGuard<RequestJob>> {
-        if let Some(job_mutex) = self.jobs.remove(key) {
-            Some(job_mutex.lock().unwrap()) // Consider handling lock poisoning
-        } else {
-            None
-        }
-    }
-}
-
-// Upon receiving a peer with a pointer, for simplicity sake we should make it first store the key with the pointer and then call the get_value function and ignore the result
