@@ -7,9 +7,7 @@ use tokio::sync::mpsc;
 */
 
 pub struct Handler {
-    database: Box<dyn Database>,
-    rx: mpsc::Receiver<Action>,
-    pub tx: mpsc::Sender<Action>,
+    tx: mpsc::Sender<Action>,
 }
 
 pub enum ActionType {
@@ -25,9 +23,10 @@ pub struct Action {
 }
 
 impl Handler {
-    pub fn new(database: Box<dyn Database>) -> Self {
+    pub fn start_new(database: Box<dyn Database>) -> Self {
         let (tx, rx) = mpsc::channel::<Action>(32);
-        Handler { database, rx, tx }
+        tokio::spawn(Self::start(database, rx));
+        Handler { tx }
     }
 
     pub async fn get(&mut self, key: Vec<u8>) -> Option<Value> {
@@ -90,18 +89,17 @@ impl Handler {
             Some(a) => a,
         }
     }
-
-    pub async fn start(&mut self) {
+    pub async fn start(mut database: Box<dyn Database>, mut rx: mpsc::Receiver<Action>) {
         loop {
             tokio::select! {
-              request = self.rx.recv() => match request {
+              request = rx.recv() => match request {
                 None => break,
                 Some(Action {key, action_type}) => {
                   match action_type {
-                    ActionType::Get(tx) => tx.send(self.database.get(&key)).await.unwrap(),
-                    ActionType::Insert(value) => self.database.insert(key, value),
-                    ActionType::Delete(tx) => tx.send(self.database.delete(&key)).await.unwrap(),
-                    ActionType::Update(value, tx) => tx.send(self.database.update(key, value)).await.unwrap(),
+                    ActionType::Get(tx) => tx.send(database.get(&key)).await.unwrap(),
+                    ActionType::Insert(value) => database.insert(key, value),
+                    ActionType::Delete(tx) => tx.send(database.delete(&key)).await.unwrap(),
+                    ActionType::Update(value, tx) => tx.send(database.update(key, value)).await.unwrap(),
 
                   };
                 }

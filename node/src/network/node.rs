@@ -53,11 +53,7 @@ impl Node {
             panic!("{}", e);
         }
 
-        let database_handler = DatabaseHandler::new(database);
-
-        tokio::spawn(async move {
-            database_handler.start().await;
-        });
+        let database_handler = DatabaseHandler::start_new(database);
 
         Node {
             swarm,
@@ -161,7 +157,8 @@ impl Node {
                 } else {
                     self.print_debug(&format!("Was told about a new key {:?}", new_key.clone()));
                     self.database_handler
-                        .insert(new_key, Value::Pointer(propagation_source.to_string()));
+                        .insert(new_key, Value::Pointer(propagation_source.to_string()))
+                        .await;
                     Ok(())
                 }
             }
@@ -202,7 +199,8 @@ impl Node {
                 ));
 
                 self.database_handler
-                    .update(key.clone(), Value::Direct(value));
+                    .update(key.clone(), Value::Direct(value))
+                    .await;
 
                 Ok(DirectoryResponse {
                     key: key.clone(),
@@ -360,7 +358,8 @@ impl Node {
 
                 if update_database_pointer {
                     self.database_handler
-                        .update(key, Value::Pointer(peer.to_string()));
+                        .update(key, Value::Pointer(peer.to_string()))
+                        .await;
                 }
 
                 Ok(())
@@ -439,7 +438,8 @@ impl Node {
             ask_gossip = if let RequestJobState::SearchingDirection(search_state) = &mut job.state {
                 if is_found {
                     self.database_handler
-                        .insert(key.clone(), Value::Pointer(peer.to_string()));
+                        .insert(key.clone(), Value::Pointer(peer.to_string()))
+                        .await;
 
                     // If key is found, proceed to get value
                     drop(job); // Explicitly drop the lock before the await point
@@ -607,33 +607,6 @@ impl Node {
         self.start_new_job(key).await
     }
 
-    async fn start_timeout_thread_for_peer_asking(
-        &mut self,
-        key: Vec<u8>,
-        job_to_timeout: Mutex<RequestJob>,
-    ) -> Option<()> {
-        // HMMMMM
-        let job_manager = self.job_manager.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            if !job_manager.jobs.contains_key(&key) {
-                return;
-            }
-
-            // Lock the job and access its state
-            let mut job = job_to_timeout.lock().await;
-            match job.state {
-                RequestJobState::SearchingDirection(SearchingJobState::AskingPeers { .. }) => {
-                    job.state = RequestJobState::Failed(DirectorySpecificErrors::KeyDoesNotExist(
-                        KeyDoesNotExist { key: key.clone() },
-                    ));
-                }
-                _ => return,
-            }
-        });
-        Some(())
-    }
-
     async fn find_key_direction_peers(
         &mut self,
         key: Vec<u8>,
@@ -643,8 +616,8 @@ impl Node {
         // imagine that a new key was added on A, and a user asked node B for that key, yet the gossip hasn't reached node B
         // we should cancel the find_key_direction_peers job
         // Also, do something for when a node is looking for the direction but receives a request too. Maybe, the node that just creates a "waiting" request
+        // Ask Peers -> Gossip -> Assume it doens't exist
 
-        //Ask Peers -> Gossip -> Assume it doens't exist
         let job_state = SearchingJobState::AskingPeers {
             peers_asked: self.swarm.connected_peers().count(),
             negative_responses: 0,
@@ -673,7 +646,39 @@ impl Node {
                 .send_request(&peer_id, request);
         }
 
-        //TODO: Create a timeout to then gossip and cancel the peer asking
+        if self.job_manager.jobs.contains_key(&key) {
+            let job_manager = self.job_manager.clone();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let job_mutex_opt = job_manager.jobs.get(&key);
+
+                /*
+                   If the job is no longer in the manager, we can assume that it was either fullfiled or some other thread as stopped it
+                */
+                let job_mutex = match job_mutex_opt {
+                    Some(a) => a,
+                    None => return,
+                };
+
+                let mut job = job_mutex.lock().await;
+                /*
+                   In case it's still searching, we change the job to does not exist.
+
+                */
+                match job.state {
+                    RequestJobState::SearchingDirection(SearchingJobState::AskingPeers {
+                        ..
+                    }) => {
+                        job.state =
+                            RequestJobState::Failed(DirectorySpecificErrors::KeyDoesNotExist(
+                                KeyDoesNotExist { key: key.clone() },
+                            ));
+                    }
+                    _ => return,
+                }
+            });
+        }
 
         Ok(job_state)
     }
@@ -690,8 +695,7 @@ impl Node {
 
         let result = match job_manager.jobs.get(&key) {
             None => {
-                // If it has no job related to this, either the node already has the key, or has to request iti
-
+                // If it has no job related to this, either the node already has the key, or has to request it
                 let next_peer = {
                     match self.database_handler.get(key.clone()).await {
                         None => match self.find_key_direction_peers(key).await {
@@ -793,7 +797,10 @@ impl Node {
     ) {
         let requester_peer_id = utils::peer_id_from_multiaddr(requester.clone()).unwrap();
 
-        self.swarm.dial(requester).unwrap();
+        let _ = self
+            .swarm
+            .dial(requester.clone())
+            .map_err(|err| println!("Error connecting and sending to {}: {}", requester, err));
 
         while !self
             .swarm
