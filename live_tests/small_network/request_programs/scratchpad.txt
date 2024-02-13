@@ -1,0 +1,6 @@
+new 1 ma1 | value
+new 2 ma2 | value
+sleep 5
+
+allbgwait ma1
+allbgwait ma2

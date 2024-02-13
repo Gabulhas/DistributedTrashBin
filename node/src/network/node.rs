@@ -409,7 +409,7 @@ impl Node {
             }
             InnerRequestValue::KeySearch => {
                 self.print_debug(&format!(
-                    "Received a Key Serach Request from {:?} for key {:?}",
+                    "Received a Key Search Request from {:?} for key {:?}",
                     peer, request.key
                 ));
                 self.handle_key_search_request(request.key, peer, channel)
@@ -455,7 +455,14 @@ impl Node {
                     } = search_state
                     {
                         *negative_responses += 1;
-                        *negative_responses >= *peers_asked
+                        if *negative_responses >= *peers_asked {
+                            job.state = RequestJobState::SearchingDirection(
+                                SearchingJobState::AskingGossip,
+                            );
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     }
@@ -463,11 +470,40 @@ impl Node {
             } else {
                 false
             };
-        } // job is dropped here, ending the immutable borrow
+        }
 
-        // ask_gossip is now used outside the scope of the job borrow
         if ask_gossip {
-            self.ask_gossip_for_key(key); // Assuming this is an async function
+            self.ask_gossip_for_key(key.clone());
+
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let job_mutex_opt = job_manager.jobs.get(&key);
+
+                /*
+                   If the job is no longer in the manager, we can assume that it was either fullfiled or some other thread as stopped it
+                */
+                let job_mutex = match job_mutex_opt {
+                    Some(a) => a,
+                    None => return,
+                };
+
+                let mut job = job_mutex.lock().await;
+                /*
+                   In case it's still searching, we change the job to does not exist.
+
+                */
+                match job.state {
+                    RequestJobState::SearchingDirection(SearchingJobState::AskingGossip) => {
+                        println!("Ooopsie on gossip :)");
+
+                        job.state =
+                            RequestJobState::Failed(DirectorySpecificErrors::KeyDoesNotExist(
+                                KeyDoesNotExist { key: key.clone() },
+                            ));
+                    }
+                    _ => return,
+                }
+            });
         }
 
         Ok(())
@@ -546,7 +582,9 @@ impl Node {
                     },
                     Some(NodeApiRequest::AddNewValue { key, value, resp_chan }) => {
                         // Process AddNewValue command
-                        let result = self.add_new_value(key, value).await; // Example function call
+                        // TODO: when the key is already present in the network
+                        // The node MUST first request the key, and when it receives it should update it
+                        let result = self.add_new_value(key, value).await;
                         let _ = resp_chan.send(result).await;
                     },
                     // ... handle other types of API commands ...
@@ -633,17 +671,16 @@ impl Node {
 
         let peer_ids: Vec<_> = self.swarm.connected_peers().cloned().collect();
 
-        for peer_id in peer_ids {
-            let request = DirectoryRequest {
-                key: key.clone(),
-                request_type: InnerRequestValue::KeySearch,
-            };
+        let request = DirectoryRequest {
+            key: key.clone(),
+            request_type: InnerRequestValue::KeySearch,
+        };
 
-            // Mutable borrow of `self.swarm` is now allowed
+        for peer_id in peer_ids {
             self.swarm
                 .behaviour_mut()
                 .request_response
-                .send_request(&peer_id, request);
+                .send_request(&peer_id, request.clone());
         }
 
         if self.job_manager.jobs.contains_key(&key) {
@@ -670,6 +707,8 @@ impl Node {
                     RequestJobState::SearchingDirection(SearchingJobState::AskingPeers {
                         ..
                     }) => {
+                        println!("Ooopsie on request :)");
+
                         job.state =
                             RequestJobState::Failed(DirectorySpecificErrors::KeyDoesNotExist(
                                 KeyDoesNotExist { key: key.clone() },
@@ -841,6 +880,9 @@ impl Node {
             .unwrap();
     }
 
+    /*
+       Ran when a user interacts with a node directly to add a new value to the network
+    */
     pub async fn add_new_value(
         &mut self,
         key: Vec<u8>,
@@ -858,7 +900,10 @@ impl Node {
                     .insert(key.clone(), Value::Direct(value))
                     .await
             }
-            Some(_) => return Err(KeyAlreadyExists { key }),
+            Some(_) => {
+                todo!(" TODO: when the key is already present in the network The node MUST first request the key, and when it receives it should update it");
+                return Err(KeyAlreadyExists { key });
+            }
         }
         self.publish_new_key(key);
         Ok(())
